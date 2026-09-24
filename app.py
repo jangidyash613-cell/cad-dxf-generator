@@ -1,129 +1,147 @@
 import streamlit as st
 import ezdxf
+from ezdxf.math import Vec3
 import tempfile
 import os
 import re
 
-st.set_page_config(
-    page_title="Micro-Tunneling DXF Customizer",
-    layout="wide"
-)
+st.set_page_config(page_title="Parametric DXF Generator", layout="centered")
 
-st.title("🚇 Micro-Tunneling & Pipe Crossing CAD Generator")
-st.markdown("Upload your baseline template DXF (`Br 462 ST-BRC...`), enter new dimensions, and generate the modified CAD file.")
+st.title("🚇 Micro-Tunneling Drawing Generator (Geometry + Text)")
+st.write("Adjust parameters to dynamically update both drawing geometry and text labels.")
 
-# Sidebar - Inputs for the variables
-st.sidebar.header("Design Parameters")
+# Upload file or use default
+uploaded_file = st.file_uploader("Upload Base DXF Template", type=["dxf"])
 
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    track_length = st.number_input("Length under Track (mm)", value=18500.0, step=100.0)
-    total_length = st.number_input("Total Barrel Length (mm)", value=32000.0, step=500.0)
-    width = st.number_input("Trench / Excavation Width (mm)", value=3200.0, step=50.0)
+# UI Inputs
+st.sidebar.header("Input Dimensions")
 
-with col2:
-    pipe_dia = st.number_input("Pipe Outer Diameter (OD) (mm)", value=1800.0, step=50.0)
-    pipe_id = st.number_input("Pipe Inner Diameter (ID) (mm)", value=1500.0, step=50.0)
-    pipe_thickness = st.number_input("Pipe Wall Thickness (mm)", value=150.0, step=5.0)
+# Current/Base dimensions (used for calculating scale factors)
+st.sidebar.subheader("Baseline (Original) Dimensions")
+base_length = st.sidebar.number_input("Original Length (mm)", value=18500.0, step=100.0)
+base_outer_dia = st.sidebar.number_input("Original Pipe Outer Dia (mm)", value=1200.0, step=50.0)
+base_thk = st.sidebar.number_input("Original Wall Thickness (mm)", value=120.0, step=5.0)
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Section A-A & B-B Labels")
-label_sec_aa = st.sidebar.text_input("Section A-A Custom Note", "SECTION A-A (CROSS SECTION)")
-label_sec_bb = st.sidebar.text_input("Section B-B Custom Note", "SECTION B-B (LONGITUDINAL)")
+# Target new dimensions
+st.sidebar.subheader("New Target Dimensions")
+new_length = st.sidebar.number_input("New Length (mm)", value=22000.0, step=100.0)
+new_outer_dia = st.sidebar.number_input("New Pipe Outer Dia (mm)", value=1500.0, step=50.0)
+new_thk = st.sidebar.number_input("New Wall Thickness (mm)", value=150.0, step=5.0)
+new_width = st.sidebar.number_input("Trench / Formation Width (mm)", value=3500.0, step=100.0)
 
-# File uploader
-uploaded_file = st.file_uploader("Upload Base DXF Drawing", type=["dxf"])
+# Layer selection
+st.sidebar.subheader("Target Layers for Geometry")
+pipe_layer = st.sidebar.text_input("Pipe Geometry Layer", value="CULVERT")
+dim_layer = st.sidebar.text_input("Dimension Layer", value="Prop. Dimensions")
 
-def update_text_entity(text_str, params):
-    """
-    Intelligently replace placeholders or known patterns in drawing annotations.
-    """
-    # Replace direct placeholders if present in template
-    text_str = text_str.replace("{LENGTH}", f"{params['length']:.0f}")
-    text_str = text_str.replace("{WIDTH}", f"{params['width']:.0f}")
-    text_str = text_str.replace("{DIA}", f"{params['dia']:.0f}")
-    text_str = text_str.replace("{THK}", f"{params['thk']:.0f}")
+def update_geometry_and_text(doc, base_len, new_len, base_dia, new_dia, base_t, new_t, width):
+    msp = doc.modelspace()
     
-    # Generic regex updates for matching common formats: e.g. "Dia. 1200", "150 thk", "L = 20.0m"
-    # Update Diameter callouts: e.g. "1200 mm DIA", "Ø1200"
-    text_str = re.sub(r'(%%c|Ø|\bDIA\.?\s*)\d+', rf'\g<1>{int(params["dia"])}', text_str, flags=re.IGNORECASE)
+    # Calculate geometric scaling factors
+    len_scale = new_len / base_len if base_len > 0 else 1.0
+    outer_radius_new = new_dia / 2.0
+    inner_radius_new = (new_dia - (2 * new_t)) / 2.0
     
-    # Update Thickness callouts: e.g. "120 THK", "THICKNESS 120"
-    text_str = re.sub(r'(\bTHK\.?\s*|\bTHICKNESS\s*)\d+', rf'\g<1>{int(params["thk"])}', text_str, flags=re.IGNORECASE)
-    
-    return text_str
+    # ---------------------------------------------------------
+    # 1. Update Geometry: Circles (Section Views / Pipe Section)
+    # ---------------------------------------------------------
+    for circle in msp.query('CIRCLE'):
+        if circle.dxf.layer.upper() == pipe_layer.upper() or pipe_layer == "":
+            current_r = circle.dxf.radius
+            # Detect whether it is the inner or outer circle based on radius
+            base_inner_r = (base_dia - (2 * base_t)) / 2.0
+            base_outer_r = base_dia / 2.0
+            
+            # If close to base outer radius, scale to new outer radius
+            if abs(current_r - base_outer_r) < 50:
+                circle.dxf.radius = outer_radius_new
+            # If close to base inner radius, scale to new inner radius
+            elif abs(current_r - base_inner_r) < 50:
+                circle.dxf.radius = inner_radius_new
+
+    # ---------------------------------------------------------
+    # 2. Update Geometry: Lines (Length Stretches in Section B-B)
+    # ---------------------------------------------------------
+    # For horizontal pipe lines running along the length axis
+    delta_length = new_len - base_len
+    if abs(delta_length) > 0.001:
+        for line in msp.query('LINE'):
+            if line.dxf.layer.upper() == pipe_layer.upper() or pipe_layer == "":
+                start = line.dxf.start
+                end = line.dxf.end
+                
+                # Check if it's a longitudinal line (mostly horizontal: delta_x >> delta_y)
+                dx = end.x - start.x
+                dy = end.y - start.y
+                if abs(dx) > abs(dy) and abs(dx) > (base_len * 0.5):
+                    # Adjust the line length by moving the endpoint
+                    if end.x > start.x:
+                        line.dxf.end = Vec3(start.x + (dx * len_scale), end.y, end.z)
+                    else:
+                        line.dxf.start = Vec3(end.x + (-dx * len_scale), start.y, start.z)
+
+    # ---------------------------------------------------------
+    # 3. Update Text and Dimension Overrides
+    # ---------------------------------------------------------
+    replacements = {
+        "{LENGTH}": f"{new_len:.0f}",
+        "{DIA}": f"{new_dia:.0f}",
+        "{THK}": f"{new_thk:.0f}",
+        "{WIDTH}": f"{width:.0f}",
+        str(int(base_len)): str(int(new_len)),
+        str(int(base_dia)): str(int(new_dia)),
+        str(int(base_t)): str(int(new_t)),
+    }
+
+    containers = [msp] + [doc.layout(name) for name in doc.layout_names()] + [b for b in doc.blocks]
+    for container in containers:
+        for e in container.query('TEXT MTEXT DIMENSION'):
+            if e.dxftype() == 'TEXT':
+                for old_val, new_val in replacements.items():
+                    if old_val in e.dxf.text:
+                        e.dxf.text = e.dxf.text.replace(old_val, new_val)
+            elif e.dxftype() == 'MTEXT':
+                for old_val, new_val in replacements.items():
+                    if old_val in e.text:
+                        e.text = e.text.replace(old_val, new_val)
+            elif e.dxftype() == 'DIMENSION':
+                if e.dxf.text:
+                    for old_val, new_val in replacements.items():
+                        if old_val in e.dxf.text:
+                            e.dxf.text = e.dxf.text.replace(old_val, new_val)
 
 if uploaded_file is not None:
-    st.success("File uploaded successfully!")
-
     if st.button("Generate & Download Updated DXF", type="primary"):
-        # 1. Save uploaded stream safely to a temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_in:
             tmp_in.write(uploaded_file.getbuffer())
             tmp_in_path = tmp_in.name
 
-        tmp_out_path = tmp_in_path.replace(".dxf", "_modified.dxf")
+        tmp_out_path = tmp_in_path.replace(".dxf", "_out.dxf")
 
         try:
-            # 2. Open using ezdxf file reader
             doc = ezdxf.readfile(tmp_in_path)
-            
-            params = {
-                "length": track_length,
-                "total_len": total_length,
-                "width": width,
-                "dia": pipe_dia,
-                "id": pipe_id,
-                "thk": pipe_thickness
-            }
 
-            count = 0
-            
-            # 3. Process Modelspace, Paperspace, and Blocks
-            all_layouts = [doc.modelspace()] + [doc.layout(name) for name in doc.layout_names()]
-            
-            for layout in all_layouts:
-                for entity in layout.query("TEXT MTEXT"):
-                    old_text = entity.dxf.text if entity.dxftype() == "TEXT" else entity.text
-                    new_text = update_text_entity(old_text, params)
-                    if new_text != old_text:
-                        if entity.dxftype() == "TEXT":
-                            entity.dxf.text = new_text
-                        else:
-                            entity.text = new_text
-                        count += 1
-
-            # Search in block definitions (where sections like A-A and B-B are usually stored)
-            for block in doc.blocks:
-                for entity in block.query("TEXT MTEXT"):
-                    old_text = entity.dxf.text if entity.dxftype() == "TEXT" else entity.text
-                    new_text = update_text_entity(old_text, params)
-                    if new_text != old_text:
-                        if entity.dxftype() == "TEXT":
-                            entity.dxf.text = new_text
-                        else:
-                            entity.text = new_text
-                        count += 1
-
-            # 4. Save to temporary output
-            doc.saveas(tmp_out_path)
-
-            # 5. Read back as bytes for browser download
-            with open(tmp_out_path, "rb") as f:
-                output_bytes = f.read()
-
-            st.success(f"Processing Complete! Updated {count} text annotations.")
-            st.download_button(
-                label="📥 Click here to Download DXF",
-                data=output_bytes,
-                file_name="Updated_" + uploaded_file.name,
-                mime="application/dxf"
+            update_geometry_and_text(
+                doc,
+                base_length, new_length,
+                base_outer_dia, new_outer_dia,
+                base_thk, new_thk,
+                new_width
             )
 
+            doc.saveas(tmp_out_path)
+
+            with open(tmp_out_path, "rb") as f:
+                st.success("Drawing geometry and dimensions successfully updated!")
+                st.download_button(
+                    label="📥 Download Modified DXF",
+                    data=f.read(),
+                    file_name="Parametric_" + uploaded_file.name,
+                    mime="application/dxf"
+                )
         except Exception as e:
-            st.error(f"Failed to process file: {str(e)}")
+            st.error(f"Error: {e}")
         finally:
-            # Clean up disk memory
             if os.path.exists(tmp_in_path):
                 os.remove(tmp_in_path)
             if os.path.exists(tmp_out_path):
