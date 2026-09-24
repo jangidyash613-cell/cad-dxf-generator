@@ -1,6 +1,7 @@
 import streamlit as st
 import ezdxf
-import io
+import tempfile
+import os
 
 st.set_page_config(page_title="Parametric DXF Generator", layout="centered")
 
@@ -20,19 +21,24 @@ if uploaded_file is not None:
     st.info(f"File uploaded: {uploaded_file.name}")
     
     if st.button("Generate & Update Drawing"):
+        # Create temporary files to prevent binary stream decode errors
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as temp_in:
+            temp_in.write(uploaded_file.getvalue())
+            temp_in_path = temp_in.name
+
+        temp_out_path = temp_in_path.replace(".dxf", "_out.dxf")
+
         try:
-            # Read DXF stream into ezdxf
-            file_contents = uploaded_file.getvalue().decode("latin1")
-            doc = ezdxf.read(io.StringIO(file_contents))
+            # Read DXF directly from disk
+            doc = ezdxf.readfile(temp_in_path)
             msp = doc.modelspace()
 
-            # Replace placeholder tags in TEXT and MTEXT entities
+            # Update placeholder text entities
             updated_count = 0
             for entity in msp.query("TEXT MTEXT"):
                 txt = entity.dxf.text
                 original = txt
                 
-                # Tag mapping: match placeholders or customize to target exact layer text
                 if "{LENGTH}" in txt:
                     txt = txt.replace("{LENGTH}", f"{pipe_length:.2f} m")
                 if "{WIDTH}" in txt:
@@ -46,12 +52,13 @@ if uploaded_file is not None:
                     entity.dxf.text = txt
                     updated_count += 1
 
-            # Export modified drawing to memory
-            out_stream = io.StringIO()
-            doc.write(out_stream)
-            out_bytes = out_stream.getvalue().encode("latin1")
+            # Save clean modified DXF
+            doc.saveas(temp_out_path)
 
-            st.success(f"Updated {updated_count} dynamic text references.")
+            with open(temp_out_path, "rb") as f:
+                out_bytes = f.read()
+
+            st.success(f"Success! Updated {updated_count} dynamic text references.")
             st.download_button(
                 label="Download Modified DXF",
                 data=out_bytes,
@@ -60,3 +67,9 @@ if uploaded_file is not None:
             )
         except Exception as e:
             st.error(f"Error processing DXF: {e}")
+        finally:
+            # Clean up temporary files
+            if os.path.exists(temp_in_path):
+                os.remove(temp_in_path)
+            if os.path.exists(temp_out_path):
+                os.remove(temp_out_path)
