@@ -12,253 +12,545 @@ except ImportError:
 
 
 st.set_page_config(
-    page_title="Bridge Pipe Drawing Generator",
+    page_title="Bridge 462 CAD Drawing Generator",
     page_icon="📐",
     layout="wide",
 )
 
-st.title("📐 Bridge Pipe Drawing Generator")
-st.caption("Bridge + Pipe + Level data are variable; the uploaded master DXF is kept as the base drawing.")
+st.title("📐 Bridge 462 CAD Drawing Generator")
+st.caption(
+    "This version edits the existing master drawing instead of adding a separate drawing."
+)
 
 
 # ============================================================
-# Utility functions
+# BASIC HELPERS
 # ============================================================
 
-def to_float(value, default=0.0):
+def f(value, default=0.0):
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
 
 
-def calculate_levels(data):
-    pipe_od_m = to_float(data["pipe_od"]) / 1000.0
-    pipe_invert = to_float(data["pipe_invert_rl"])
-    underside = to_float(data["bridge_underside_rl"])
-    slope_percent = to_float(data["pipe_slope"])
-    pipe_length = to_float(data["pipe_length"])
-
-    pipe_centre = pipe_invert + pipe_od_m / 2.0
-    pipe_top = pipe_invert + pipe_od_m
-
-    end_invert = pipe_invert + (
-        pipe_length * slope_percent / 100.0
-    )
-
-    clearance = underside - pipe_top
-
-    return {
-        "pipe_od_m": pipe_od_m,
-        "pipe_center_rl": pipe_centre,
-        "pipe_top_rl": pipe_top,
-        "pipe_end_invert_rl": end_invert,
-        "available_clearance": clearance,
-    }
-
-
-def read_uploaded_dxf(uploaded_file):
+def get_dimension_text(doc, dim):
     """
-    Read the uploaded DXF through a real temporary file.
-
-    This is intentionally used instead of:
-        ezdxf.read(io.BytesIO(...))
-
-    because ezdxf's normal file reader is more reliable when it receives
-    an actual DXF file path.
+    Read visible dimension text from the DIMENSION entity.
     """
+    return str(dim.dxf.get("text", "") or "")
 
+
+def set_vec_x(vec, x):
+    return (x, vec.y, vec.z)
+
+
+def set_vec_y(vec, y):
+    return (vec.x, y, vec.z)
+
+
+# ============================================================
+# DXF READING
+# ============================================================
+
+def read_dxf(uploaded_file):
     if ezdxf is None:
         raise RuntimeError(
-            "The ezdxf package is not installed. "
-            "Add 'ezdxf' to requirements.txt and redeploy."
+            "ezdxf is not installed. Put 'ezdxf' in requirements.txt."
         )
 
     if uploaded_file is None:
-        raise RuntimeError("No master drawing was uploaded.")
+        raise RuntimeError("Please upload the master DXF.")
 
-    file_bytes = uploaded_file.getvalue()
+    raw = uploaded_file.getvalue()
 
-    if not file_bytes:
-        raise RuntimeError("The uploaded file is empty.")
+    if not raw:
+        raise RuntimeError("The uploaded DXF file is empty.")
 
-    suffix = Path(uploaded_file.name).suffix.lower()
-
-    # Do not reject the drawing merely because of its filename.
-    # We inspect the actual DXF contents.
-    if suffix not in (".dxf", ""):
-        raise RuntimeError(
-            "Please upload the master drawing as a DXF file."
-        )
-
-    temp_path = None
+    temp_name = None
 
     try:
         with tempfile.NamedTemporaryFile(
-            mode="wb",
             suffix=".dxf",
             delete=False,
-        ) as temp:
-            temp.write(file_bytes)
-            temp.flush()
-            temp_path = temp.name
+        ) as tmp:
+            tmp.write(raw)
+            tmp.flush()
+            temp_name = tmp.name
 
         try:
-            doc = ezdxf.readfile(temp_path)
-        except Exception as first_error:
-            # Try the recovery reader for drawings with minor DXF problems.
-            try:
-                from ezdxf import recover
+            return ezdxf.readfile(temp_name)
+        except Exception:
+            from ezdxf import recover
 
-                doc, auditor = recover.readfile(temp_path)
+            doc, auditor = recover.readfile(temp_name)
 
-                if auditor.has_errors:
-                    st.warning(
-                        "The DXF was opened with ezdxf recovery mode. "
-                        "Some non-critical DXF errors may exist."
-                    )
-            except Exception as recovery_error:
-                raise RuntimeError(
-                    "The uploaded file has a DXF filename, but ezdxf "
-                    "could not read its contents. "
-                    "The application has tried normal and recovery DXF "
-                    "reading. Please upload the original AutoCAD DXF."
-                ) from recovery_error
+            if auditor.has_errors:
+                st.warning(
+                    "The DXF required ezdxf recovery mode. "
+                    "The drawing was opened, but the source contains "
+                    "some DXF audit issues."
+                )
 
-        return doc
+            return doc
 
     finally:
-        if temp_path:
+        if temp_name:
             try:
-                os.remove(temp_path)
+                os.remove(temp_name)
             except OSError:
                 pass
 
 
-def ensure_layer(doc, name, color):
-    if name not in doc.layers:
-        doc.layers.add(name=name, color=color)
+# ============================================================
+# FIND THE ACTUAL EXISTING 462 DIMENSIONS
+# ============================================================
 
-
-def add_generated_pipe(doc, data, levels):
+def find_section_length_dimensions(doc):
     """
-    Adds generated pipe geometry.
+    In the supplied 462 master DXF, Section A-A has two existing
+    horizontal 30140 dimensions.
 
-    IMPORTANT:
-    This is intentionally on separate layers. It does not delete or
-    overwrite the master drawing.
+    Their handles in the supplied master are:
+        309E29D
+        309E4EA
 
-    The coordinates are currently a placeholder until the exact
-    462 master drawing entity positions are mapped.
+    We first try the handles. If handles changed after a CAD save,
+    we fall back to finding horizontal DIMENSION entities whose
+    measured length is approximately 30140 mm.
     """
 
-    msp = doc.modelspace()
+    found = []
 
-    ensure_layer(doc, "GENERATED_PIPE", 1)
-    ensure_layer(doc, "GENERATED_TEXT", 2)
+    for handle in ("309E29D", "309E4EA"):
+        entity = doc.entitydb.get(handle)
+        if entity is not None and entity.dxftype() == "DIMENSION":
+            found.append(entity)
 
-    # Temporary origin.
-    # This must later be replaced with the actual pipe position
-    # found in the 462 master drawing.
-    x0 = 0.0
-    y0 = 0.0
+    if len(found) >= 2:
+        return found[:2]
 
-    od = levels["pipe_od_m"]
-    length = to_float(data["pipe_length"], 20.0)
-    angle_deg = to_float(data["crossing_angle"], 90.0)
+    candidates = []
 
-    angle = math.radians(angle_deg)
+    for entity in doc.modelspace():
+        if entity.dxftype() != "DIMENSION":
+            continue
 
-    dx = length * math.cos(angle)
-    dy = length * math.sin(angle)
+        try:
+            measurement = float(entity.dxf.actual_measurement)
+            p2 = entity.dxf.defpoint2
+            p3 = entity.dxf.defpoint3
 
-    # Perpendicular vector for pipe width.
-    nx = -math.sin(angle) * od / 2.0
-    ny = math.cos(angle) * od / 2.0
+            horizontal = abs(p2.y - p3.y) < 5.0
+            close_to_original = abs(measurement - 30140.0) < 5.0
 
-    geometry = [
-        # Centreline
-        ((x0, y0), (x0 + dx, y0 + dy)),
+            if horizontal and close_to_original:
+                candidates.append(entity)
 
-        # Pipe sides
-        (
-            (x0 + nx, y0 + ny),
-            (x0 + dx + nx, y0 + dy + ny),
-        ),
-        (
-            (x0 - nx, y0 - ny),
-            (x0 + dx - nx, y0 + dy - ny),
-        ),
+        except Exception:
+            continue
 
-        # Start cap
-        (
-            (x0 + nx, y0 + ny),
-            (x0 - nx, y0 - ny),
-        ),
-
-        # End cap
-        (
-            (x0 + dx + nx, y0 + dy + ny),
-            (x0 + dx - nx, y0 + dy - ny),
-        ),
-    ]
-
-    for start, end in geometry:
-        msp.add_line(
-            start,
-            end,
-            dxfattribs={"layer": "GENERATED_PIPE"},
-        )
-
-    notes = [
-        f"BRIDGE/DRAWING NO.: {data['drawing_no']}",
-        f"CHAINAGE: {data['chainage']}",
-        f"PIPE OD: {data['pipe_od']:.1f} mm",
-        f"NO. OF PIPES: {data['number_of_pipes']}",
-        f"PIPE INVERT RL: {to_float(data['pipe_invert_rl']):.3f}",
-        f"PIPE CENTRE RL: {levels['pipe_center_rl']:.3f}",
-        f"PIPE TOP RL: {levels['pipe_top_rl']:.3f}",
-        f"PIPE END INVERT RL: {levels['pipe_end_invert_rl']:.3f}",
-        f"AVAILABLE CLEARANCE: {levels['available_clearance']:.3f} m",
-    ]
-
-    y = -2.0
-
-    for note in notes:
-        text = msp.add_text(
-            note,
-            dxfattribs={
-                "layer": "GENERATED_TEXT",
-                "height": 0.25,
-            },
-        )
-        text.set_placement((x0, y))
-        y -= 0.35
+    return candidates[:2]
 
 
-def make_output_dxf(uploaded_file, data):
-    doc = read_uploaded_dxf(uploaded_file)
+def find_gl_dimensions(doc):
+    """
+    Find the two existing G.L. dimensions in Section A-A.
+    """
 
-    levels = calculate_levels(data)
+    result = []
 
-    add_generated_pipe(
-        doc,
-        data,
-        levels,
+    for handle in ("309E2F4", "309E2FD"):
+        entity = doc.entitydb.get(handle)
+        if entity is not None and entity.dxftype() == "DIMENSION":
+            result.append(entity)
+
+    if len(result) >= 2:
+        return result[:2]
+
+    for entity in doc.modelspace():
+        if entity.dxftype() != "DIMENSION":
+            continue
+
+        text = get_dimension_text(doc, entity).upper()
+
+        if "G.L." in text or "G.L" in text:
+            result.append(entity)
+
+    return result[:2]
+
+
+def find_bed_level_dimensions(doc):
+    """
+    Find the existing BED LEVEL dimensions around Section A-A.
+    """
+
+    result = []
+
+    for entity in doc.modelspace():
+        if entity.dxftype() != "DIMENSION":
+            continue
+
+        text = get_dimension_text(doc, entity).upper()
+
+        if "BED LEVEL" in text:
+            result.append(entity)
+
+    return result
+
+
+# ============================================================
+# UPDATE SECTION A-A LENGTH
+# ============================================================
+
+def update_length_dimension(dim, new_length_mm):
+    """
+    Change the existing dimension itself.
+
+    The original drawing is in millimetres:
+        30140 = 30.140 m
+
+    The left endpoint is retained.
+    The right endpoint is moved to:
+        left + new_length
+    """
+
+    left_x = dim.dxf.defpoint2.x
+    new_right_x = left_x + new_length_mm
+
+    dim.dxf.defpoint = set_vec_x(
+        dim.dxf.defpoint,
+        new_right_x,
     )
 
+    dim.dxf.defpoint3 = set_vec_x(
+        dim.dxf.defpoint3,
+        new_right_x,
+    )
+
+    dim.dxf.text_midpoint = set_vec_x(
+        dim.dxf.text_midpoint,
+        left_x + new_length_mm / 2.0,
+    )
+
+    dim.dxf.actual_measurement = float(new_length_mm)
+
+    # Let ezdxf rebuild the graphical dimension block.
+    dim.render()
+
+
+def stretch_section_geometry(
+    doc,
+    old_left,
+    old_right,
+    new_right,
+):
+    """
+    Stretch the actual Section A-A geometry horizontally.
+
+    This is the important difference from the previous code.
+
+    We do NOT simply add a new pipe at 0,0.
+
+    Existing lines/polylines/text in the Section A-A drawing
+    are stretched between the existing left and right barrel
+    boundaries.
+
+    Y coordinates and text heights are preserved.
+    """
+
+    if abs(old_right - old_left) < 1:
+        return
+
+    scale = (new_right - old_left) / (old_right - old_left)
+
+    xmin = old_left - 400.0
+    xmax = old_right + 400.0
+
+    # Section A-A vertical range in the supplied master.
+    ymin = -599200.0
+    ymax = -594000.0
+
+    def sx(x):
+        return old_left + (x - old_left) * scale
+
+    for entity in list(doc.modelspace()):
+
+        typ = entity.dxftype()
+
+        # ----------------------------------------------------
+        # LINE
+        # ----------------------------------------------------
+        if typ == "LINE":
+            p1 = entity.dxf.start
+            p2 = entity.dxf.end
+
+            if (
+                ymin <= p1.y <= ymax
+                and ymin <= p2.y <= ymax
+                and xmin <= p1.x <= xmax
+                and xmin <= p2.x <= xmax
+            ):
+                entity.dxf.start = (sx(p1.x), p1.y, p1.z)
+                entity.dxf.end = (sx(p2.x), p2.y, p2.z)
+
+        # ----------------------------------------------------
+        # LWPOLYLINE
+        # ----------------------------------------------------
+        elif typ == "LWPOLYLINE":
+            points = list(entity.get_points())
+
+            if not points:
+                continue
+
+            if all(
+                ymin <= p[1] <= ymax
+                and xmin <= p[0] <= xmax
+                for p in points
+            ):
+                new_points = []
+
+                for p in points:
+                    new_points.append(
+                        (
+                            sx(p[0]),
+                            p[1],
+                            p[2],
+                            p[3],
+                            p[4],
+                        )
+                    )
+
+                entity.set_points(new_points)
+
+        # ----------------------------------------------------
+        # TEXT
+        # ----------------------------------------------------
+        elif typ == "TEXT":
+            p = entity.dxf.insert
+
+            if (
+                ymin <= p.y <= ymax
+                and xmin <= p.x <= xmax
+            ):
+                entity.dxf.insert = (sx(p.x), p.y, p.z)
+
+        # ----------------------------------------------------
+        # MTEXT
+        # ----------------------------------------------------
+        elif typ == "MTEXT":
+            p = entity.dxf.insert
+
+            if (
+                ymin <= p.y <= ymax
+                and xmin <= p.x <= xmax
+            ):
+                entity.dxf.insert = (sx(p.x), p.y, p.z)
+
+        # ----------------------------------------------------
+        # DIMENSIONS
+        # ----------------------------------------------------
+        elif typ == "DIMENSION":
+            try:
+                pts = [
+                    entity.dxf.defpoint,
+                    entity.dxf.defpoint2,
+                    entity.dxf.defpoint3,
+                    entity.dxf.text_midpoint,
+                ]
+
+                if all(
+                    ymin <= p.y <= ymax
+                    and xmin <= p.x <= xmax
+                    for p in pts
+                ):
+                    entity.dxf.defpoint = (
+                        sx(entity.dxf.defpoint.x),
+                        entity.dxf.defpoint.y,
+                        entity.dxf.defpoint.z,
+                    )
+
+                    entity.dxf.defpoint2 = (
+                        sx(entity.dxf.defpoint2.x),
+                        entity.dxf.defpoint2.y,
+                        entity.dxf.defpoint2.z,
+                    )
+
+                    entity.dxf.defpoint3 = (
+                        sx(entity.dxf.defpoint3.x),
+                        entity.dxf.defpoint3.y,
+                        entity.dxf.defpoint3.z,
+                    )
+
+                    entity.dxf.text_midpoint = (
+                        sx(entity.dxf.text_midpoint.x),
+                        entity.dxf.text_midpoint.y,
+                        entity.dxf.text_midpoint.z,
+                    )
+
+                    entity.render()
+
+            except Exception:
+                pass
+
+
+# ============================================================
+# UPDATE G.L. LEVEL
+# ============================================================
+
+def update_gl_dimension(dim, new_rl):
+    """
+    Existing G.L. dimensions use drawing units in mm.
+
+    Example:
+        97.300 m = 97300 mm above the dimension base point.
+    """
+
+    base_y = dim.dxf.defpoint.y
+
+    new_y = base_y + float(new_rl) * 1000.0
+
+    dim.dxf.defpoint2 = set_vec_y(
+        dim.dxf.defpoint2,
+        new_y,
+    )
+
+    dim.dxf.defpoint3 = set_vec_y(
+        dim.dxf.defpoint3,
+        new_y,
+    )
+
+    # Keep the normal dimension text position slightly below the level line.
+    dim.dxf.text_midpoint = set_vec_y(
+        dim.dxf.text_midpoint,
+        new_y - 206.0,
+    )
+
+    dim.dxf.actual_measurement = float(new_rl)
+    dim.dxf.text = f"G.L.  {float(new_rl):.3f}"
+
+    dim.render()
+
+
+# ============================================================
+# UPDATE BED LEVEL
+# ============================================================
+
+def update_bed_dimension(dim, new_rl):
+    """
+    Update an existing BED LEVEL dimension.
+    """
+
+    base_y = dim.dxf.defpoint.y
+    new_y = base_y + float(new_rl) * 1000.0
+
+    dim.dxf.defpoint2 = set_vec_y(
+        dim.dxf.defpoint2,
+        new_y,
+    )
+
+    dim.dxf.defpoint3 = set_vec_y(
+        dim.dxf.defpoint3,
+        new_y,
+    )
+
+    dim.dxf.text_midpoint = set_vec_y(
+        dim.dxf.text_midpoint,
+        new_y - 206.0,
+    )
+
+    dim.dxf.actual_measurement = float(new_rl)
+
+    # Preserve the original formatting/color controls while replacing
+    # only the displayed level.
+    old_text = get_dimension_text(None, dim)
+
+    if "{\\C" in old_text:
+        dim.dxf.text = "{\\C0;BED LEVEL %.3f}" % float(new_rl)
+    else:
+        dim.dxf.text = "BED LEVEL %.3f" % float(new_rl)
+
+    dim.render()
+
+
+# ============================================================
+# MODIFY THE EXISTING MASTER DRAWING
+# ============================================================
+
+def modify_master(
+    uploaded_file,
+    section_length_mm,
+    gl_rl,
+    bed_rl,
+):
+    doc = read_dxf(uploaded_file)
+
+    length_dims = find_section_length_dimensions(doc)
+
+    if not length_dims:
+        raise RuntimeError(
+            "Could not locate the existing 30140 Section A-A "
+            "dimension in this master drawing."
+        )
+
+    gl_dims = find_gl_dimensions(doc)
+
+    if not gl_dims:
+        raise RuntimeError(
+            "Could not locate the existing G.L. 97.300 "
+            "dimensions in Section A-A."
+        )
+
+    old_length = float(
+        length_dims[0].dxf.actual_measurement
+    )
+
+    old_left = length_dims[0].dxf.defpoint2.x
+    old_right = length_dims[0].dxf.defpoint3.x
+
+    # Stretch actual Section A-A geometry first.
+    stretch_section_geometry(
+        doc,
+        old_left,
+        old_right,
+        old_left + section_length_mm,
+    )
+
+    # Update both existing barrel-length dimensions.
+    for dim in length_dims:
+        update_length_dimension(
+            dim,
+            section_length_mm,
+        )
+
+    # Update both existing G.L. dimensions.
+    for dim in gl_dims:
+        update_gl_dimension(
+            dim,
+            gl_rl,
+        )
+
+    # Update existing bed-level dimensions if requested.
+    bed_dims = find_bed_level_dimensions(doc)
+
+    for dim in bed_dims:
+        update_bed_dimension(
+            dim,
+            bed_rl,
+        )
+
+    # Save to a temporary DXF.
     with tempfile.NamedTemporaryFile(
-        mode="wb",
         suffix=".dxf",
         delete=False,
-    ) as output:
-        output_path = output.name
+    ) as tmp:
+        output_path = tmp.name
 
     try:
         doc.saveas(output_path)
 
-        with open(output_path, "rb") as f:
-            output_bytes = f.read()
+        with open(output_path, "rb") as file:
+            output_bytes = file.read()
 
     finally:
         try:
@@ -266,20 +558,20 @@ def make_output_dxf(uploaded_file, data):
         except OSError:
             pass
 
-    return output_bytes, levels, doc
+    return output_bytes, doc, old_length
 
 
 # ============================================================
-# Sidebar
+# SIDEBAR
 # ============================================================
 
 with st.sidebar:
-    st.header("Master Drawing")
+    st.header("Master CAD")
 
     master_file = st.file_uploader(
-        "Upload Master DXF",
+        "Upload master DXF",
         type=["dxf"],
-        help="Upload your AutoCAD DXF master drawing.",
+        help="Upload master_plan1.dxf or your equivalent master DXF.",
     )
 
     if master_file:
@@ -287,46 +579,45 @@ with st.sidebar:
             f"Loaded: {master_file.name}"
         )
 
-        st.caption(
-            f"File size: {len(master_file.getvalue()):,} bytes"
-        )
-
     st.divider()
 
-    st.info(
-        "The master DXF is used as the fixed drawing template. "
-        "Only Bridge Data, Pipe Data and Level Data are intended "
-        "to be variable."
+    st.write(
+        "This version edits the existing Section A-A dimensions "
+        "inside the master CAD."
     )
 
 
 # ============================================================
-# Input sections
+# USER INPUTS
 # ============================================================
 
-bridge_col, pipe_col, level_col = st.columns(3)
+st.subheader("Bridge Data")
 
+c1, c2, c3, c4 = st.columns(4)
 
-with bridge_col:
-    st.subheader("Bridge Data")
-
+with c1:
     drawing_no = st.text_input(
         "Bridge / Drawing No.",
         value="462",
     )
 
+with c2:
     chainage = st.text_input(
         "Chainage",
-        value="273.640",
+        value="274/60.10",
     )
 
-    span_length = st.number_input(
-        "Span Length (m)",
-        value=2.400,
+with c3:
+    section_length_m = st.number_input(
+        "Section A-A Length (m)",
+        min_value=0.001,
+        value=30.140,
         step=0.001,
         format="%.3f",
+        help="Existing master value is 30140 mm = 30.140 m.",
     )
 
+with c4:
     bridge_width = st.number_input(
         "Bridge Width (m)",
         value=8.000,
@@ -335,25 +626,27 @@ with bridge_col:
     )
 
 
-with pipe_col:
-    st.subheader("Pipe Data")
+st.subheader("Pipe Data")
 
+p1, p2, p3, p4 = st.columns(4)
+
+with p1:
     pipe_od = st.number_input(
         "Pipe OD (mm)",
         min_value=1.0,
         value=1200.0,
         step=1.0,
-        format="%.1f",
     )
 
+with p2:
     pipe_id = st.number_input(
         "Pipe ID (mm)",
         min_value=0.0,
         value=1000.0,
         step=1.0,
-        format="%.1f",
     )
 
+with p3:
     number_of_pipes = st.number_input(
         "Number of Pipes",
         min_value=1,
@@ -361,14 +654,7 @@ with pipe_col:
         step=1,
     )
 
-    pipe_length = st.number_input(
-        "Pipe Length (m)",
-        min_value=0.001,
-        value=20.000,
-        step=0.001,
-        format="%.3f",
-    )
-
+with p4:
     pipe_slope = st.number_input(
         "Pipe Slope (%)",
         value=0.500,
@@ -376,53 +662,38 @@ with pipe_col:
         format="%.3f",
     )
 
-    pipe_spacing = st.number_input(
-        "Pipe Spacing (m)",
-        min_value=0.000,
-        value=1.500,
+
+st.subheader("Level Data")
+
+l1, l2, l3, l4 = st.columns(4)
+
+with l1:
+    gl_rl = st.number_input(
+        "G.L. RL (m)",
+        value=97.300,
         step=0.001,
         format="%.3f",
+        help="Existing master value is 97.300.",
     )
 
-    crossing_angle = st.number_input(
-        "Crossing Angle (degrees)",
-        value=90.0,
-        step=0.1,
-        format="%.1f",
-    )
-
-
-with level_col:
-    st.subheader("Level Data")
-
+with l2:
     bed_rl = st.number_input(
-        "Existing / Bed RL (m)",
-        value=100.000,
+        "Bed Level RL (m)",
+        value=96.271,
         step=0.001,
         format="%.3f",
+        help="Existing master value is 96.271.",
     )
 
-    bridge_underside_rl = st.number_input(
-        "Bridge Underside RL (m)",
-        value=103.000,
-        step=0.001,
-        format="%.3f",
-    )
-
+with l3:
     pipe_invert_rl = st.number_input(
         "Pipe Invert RL (m)",
-        value=101.000,
+        value=95.000,
         step=0.001,
         format="%.3f",
     )
 
-    required_cover = st.number_input(
-        "Required Cover (m)",
-        value=1.000,
-        step=0.001,
-        format="%.3f",
-    )
-
+with l4:
     required_clearance = st.number_input(
         "Required Clearance (m)",
         value=0.600,
@@ -431,141 +702,125 @@ with level_col:
     )
 
 
-data = {
-    "drawing_no": drawing_no,
-    "chainage": chainage,
-    "span_length": span_length,
-    "bridge_width": bridge_width,
-    "pipe_od": pipe_od,
-    "pipe_id": pipe_id,
-    "number_of_pipes": number_of_pipes,
-    "pipe_length": pipe_length,
-    "pipe_slope": pipe_slope,
-    "pipe_spacing": pipe_spacing,
-    "crossing_angle": crossing_angle,
-    "bed_rl": bed_rl,
-    "bridge_underside_rl": bridge_underside_rl,
-    "pipe_invert_rl": pipe_invert_rl,
-    "required_cover": required_cover,
-    "required_clearance": required_clearance,
-}
-
-
 # ============================================================
-# Calculations
+# CALCULATED PIPE LEVELS
 # ============================================================
 
-levels = calculate_levels(data)
+pipe_od_m = pipe_od / 1000.0
+
+pipe_center_rl = pipe_invert_rl + pipe_od_m / 2.0
+pipe_top_rl = pipe_invert_rl + pipe_od_m
+
+available_clearance = gl_rl - pipe_top_rl
 
 st.divider()
-st.subheader("Calculated Levels")
 
-c1, c2, c3, c4 = st.columns(4)
+st.subheader("Calculated Pipe Levels")
 
-c1.metric(
+a1, a2, a3 = st.columns(3)
+
+a1.metric(
     "Pipe Centre RL",
-    f"{levels['pipe_center_rl']:.3f} m",
+    f"{pipe_center_rl:.3f}",
 )
 
-c2.metric(
+a2.metric(
     "Pipe Top RL",
-    f"{levels['pipe_top_rl']:.3f} m",
+    f"{pipe_top_rl:.3f}",
 )
 
-c3.metric(
-    "End Invert RL",
-    f"{levels['pipe_end_invert_rl']:.3f} m",
-)
-
-c4.metric(
+a3.metric(
     "Available Clearance",
-    f"{levels['available_clearance']:.3f} m",
+    f"{available_clearance:.3f} m",
 )
 
-if levels["available_clearance"] < required_clearance:
+if available_clearance < required_clearance:
     st.warning(
-        f"Available clearance is {levels['available_clearance']:.3f} m, "
-        f"below the required {required_clearance:.3f} m."
-    )
-else:
-    st.success(
-        f"Available clearance is {levels['available_clearance']:.3f} m "
-        f"and meets the required clearance."
+        "Pipe top is below the required G.L. clearance."
     )
 
 
 # ============================================================
-# Generate
+# GENERATE
 # ============================================================
 
 st.divider()
 
 if st.button(
-    "Generate Drawing",
+    "Generate Edited Drawing",
     type="primary",
     use_container_width=True,
 ):
 
     if master_file is None:
         st.error(
-            "Please upload your master DXF first."
+            "Upload master_plan1.dxf first."
         )
         st.stop()
 
     if ezdxf is None:
         st.error(
-            "ezdxf is not installed. Add ezdxf to requirements.txt "
-            "and redeploy the Streamlit application."
+            "ezdxf is missing. Add ezdxf to requirements.txt "
+            "and redeploy Streamlit."
         )
         st.stop()
 
-    try:
-        with st.spinner("Reading master DXF and generating drawing..."):
+    new_length_mm = section_length_m * 1000.0
 
-            output_bytes, final_levels, document = make_output_dxf(
+    try:
+        with st.spinner(
+            "Editing the existing CAD dimensions and Section A-A geometry..."
+        ):
+
+            output, edited_doc, old_length = modify_master(
                 master_file,
-                data,
+                new_length_mm,
+                gl_rl,
+                bed_rl,
             )
 
-        entity_count = len(document.modelspace())
-        layer_count = len(document.layers)
-        block_count = len(document.blocks)
-
         st.success(
-            "Drawing generated successfully."
+            "The existing master drawing has been edited."
         )
 
         st.write(
-            f"Master DXF read successfully: "
-            f"{entity_count:,} model-space entities, "
-            f"{layer_count:,} layers, "
-            f"{block_count:,} blocks."
+            f"Section A-A length changed from "
+            f"{old_length / 1000.0:.3f} m "
+            f"to {section_length_m:.3f} m."
+        )
+
+        st.write(
+            f"G.L. changed to {gl_rl:.3f} m."
+        )
+
+        st.write(
+            f"Bed Level changed to {bed_rl:.3f} m."
         )
 
         filename = (
             f"Bridge_{drawing_no}_"
-            f"Chainage_{chainage.replace('.', '_')}.dxf"
+            f"Edited_Chainage_"
+            f"{chainage.replace('/', '_').replace('.', '_')}.dxf"
         )
 
         st.download_button(
-            label="⬇ Download Generated DXF",
-            data=output_bytes,
+            label="⬇ Download Edited DXF",
+            data=output,
             file_name=filename,
             mime="application/dxf",
             use_container_width=True,
         )
 
         st.info(
-            "The uploaded master drawing is retained. "
-            "Generated pipe geometry is currently placed on "
-            "GENERATED_PIPE and GENERATED_TEXT layers. "
-            "Exact modification of the original 462 drawing "
-            "objects requires mapping their actual CAD entities."
+            "The program now modifies the existing 30140 mm and "
+            "97.300 G.L. dimensions in the supplied 462 master drawing. "
+            "It also horizontally stretches the Section A-A geometry "
+            "between the existing barrel boundaries."
         )
 
     except Exception as error:
         st.error(
-            "Drawing generation failed."
+            "Drawing editing failed."
         )
 
         st.code(
@@ -573,65 +828,84 @@ if st.button(
             language="text",
         )
 
-        st.markdown(
-            """
-**Important:** This error is now coming from the actual DXF reader,
-not from the filename extension. If your `master_plan1.dxf` is the
-same file that was previously validated, this version should read it
-using a temporary `.dxf` file and `ezdxf.readfile()`.
-
-If it still fails, the exact error shown in the box above will tell us
-which DXF feature is causing the problem.
-"""
-        )
-
 
 # ============================================================
-# Diagnostics
+# DIAGNOSTICS
 # ============================================================
 
-with st.expander("DXF diagnostics"):
+with st.expander("Master drawing diagnostics"):
 
     if master_file is None:
         st.write("No master DXF uploaded.")
+
+    elif ezdxf is None:
+        st.error("ezdxf is not installed.")
+
     else:
-        st.write("Filename:", master_file.name)
-        st.write("Bytes:", len(master_file.getvalue()))
+        try:
+            diagnostic_doc = read_dxf(master_file)
 
-        if ezdxf is None:
-            st.error("ezdxf is not installed.")
-        else:
-            if st.button("Test Master DXF"):
-                try:
-                    test_doc = read_uploaded_dxf(master_file)
+            st.success("Master DXF successfully read.")
 
-                    st.success("DXF read successfully.")
+            st.write(
+                "DXF version:",
+                diagnostic_doc.dxfversion,
+            )
 
-                    st.write(
-                        "DXF version:",
-                        test_doc.dxfversion,
-                    )
+            st.write(
+                "Model-space entities:",
+                len(diagnostic_doc.modelspace()),
+            )
 
-                    st.write(
-                        "Model-space entities:",
-                        len(test_doc.modelspace()),
-                    )
+            st.write(
+                "Layers:",
+                len(diagnostic_doc.layers),
+            )
 
-                    st.write(
-                        "Layers:",
-                        len(test_doc.layers),
-                    )
+            st.write(
+                "Blocks:",
+                len(diagnostic_doc.blocks),
+            )
 
-                    st.write(
-                        "Blocks:",
-                        len(test_doc.blocks),
-                    )
+            length_dims = find_section_length_dimensions(
+                diagnostic_doc
+            )
 
-                except Exception as error:
-                    st.error(
-                        "DXF test failed."
-                    )
-                    st.code(
-                        str(error),
-                        language="text",
-                    )
+            gl_dims = find_gl_dimensions(
+                diagnostic_doc
+            )
+
+            bed_dims = find_bed_level_dimensions(
+                diagnostic_doc
+            )
+
+            st.write(
+                "Section A-A length dimensions found:",
+                len(length_dims),
+            )
+
+            st.write(
+                "G.L. dimensions found:",
+                len(gl_dims),
+            )
+
+            st.write(
+                "Bed-level dimensions found:",
+                len(bed_dims),
+            )
+
+            if length_dims:
+                st.write(
+                    "Current Section A-A length:",
+                    f"{length_dims[0].dxf.actual_measurement:.0f} mm",
+                )
+
+            if gl_dims:
+                st.write(
+                    "Current G.L.:",
+                    gl_dims[0].dxf.text,
+                )
+
+        except Exception as error:
+            st.error("DXF diagnostic failed.")
+            st.code(str(error), language="text")
