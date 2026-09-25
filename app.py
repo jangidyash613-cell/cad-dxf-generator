@@ -1,2332 +1,567 @@
-```python
-# ============================================================
-# BRIDGE / PIPE UNDER BRIDGE DRAWING GENERATOR
-# Single Python File
-# ============================================================
-#
-# INSTALL:
-#
-# pip install flask ezdxf werkzeug
-#
-# RUN:
-#
-# python app.py
-#
-# OPEN:
-#
-# http://127.0.0.1:5000
-#
-# ============================================================
-
-from flask import (
-    Flask,
-    request,
-    render_template_string,
-    send_file,
-    jsonify
-)
-
-from werkzeug.utils import secure_filename
-
+import os
+import math
+import uuid
 from pathlib import Path
 
-import ezdxf
+from flask import Flask, request, send_file, render_template_string, jsonify
 
-import os
-import uuid
-import math
-import json
-
-
-# ============================================================
-# APPLICATION
-# ============================================================
+try:
+    import ezdxf
+except ImportError:
+    ezdxf = None
 
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
+TEMPLATE_DIR = BASE_DIR / "templates"
+UPLOAD_DIR = BASE_DIR / "uploads"
+OUTPUT_DIR = BASE_DIR / "outputs"
 
-UPLOAD_FOLDER = BASE_DIR / "uploads"
-OUTPUT_FOLDER = BASE_DIR / "output"
-TEMPLATE_FOLDER = BASE_DIR / "templates"
+TEMPLATE_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
 
-UPLOAD_FOLDER.mkdir(exist_ok=True)
-OUTPUT_FOLDER.mkdir(exist_ok=True)
-TEMPLATE_FOLDER.mkdir(exist_ok=True)
-
-
-# ============================================================
-# MASTER DRAWING
-# ============================================================
-#
-# Put your fixed master drawing here:
-#
-# templates/master.dxf
-#
-# Your 462 DWG should eventually be converted to DXF and
-# placed here.
-#
-# Everything in the master drawing remains CONSTANT.
-#
-# Only:
-#
-#       BRIDGE
-#       PIPE
-#       LEVEL
-#
-# parameters are changed.
-#
-# ============================================================
-
-MASTER_TEMPLATE = TEMPLATE_FOLDER / "master.dxf"
+MASTER_DXF = TEMPLATE_DIR / "master.dxf"
 
 
-# ============================================================
-# HTML
-# ============================================================
-
-HTML = r"""
-<!DOCTYPE html>
-
-<html>
-
+HTML = """
+<!doctype html>
+<html lang="en">
 <head>
-
-<meta charset="UTF-8">
-
-<meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
-
-<title>
-Bridge Pipe Drawing Generator
-</title>
-
-
-<style>
-
-* {
-    box-sizing: border-box;
-}
-
-
-body {
-
-    margin: 0;
-
-    font-family:
-        Arial,
-        Helvetica,
-        sans-serif;
-
-    background: #f2f4f7;
-
-    color: #1f2937;
-
-}
-
-
-.header {
-
-    background: #17202a;
-
-    color: white;
-
-    padding: 25px;
-
-}
-
-
-.header h1 {
-
-    margin: 0;
-
-    font-size: 28px;
-
-}
-
-
-.header p {
-
-    margin-top: 8px;
-
-    opacity: .8;
-
-}
-
-
-.container {
-
-    width: 95%;
-
-    max-width: 1200px;
-
-    margin: 25px auto 60px;
-
-}
-
-
-.card {
-
-    background: white;
-
-    padding: 25px;
-
-    margin-bottom: 20px;
-
-    border-radius: 10px;
-
-    box-shadow:
-        0 2px 10px
-        rgba(0,0,0,.08);
-
-}
-
-
-.card h2 {
-
-    margin-top: 0;
-
-    border-bottom:
-        1px solid #e5e7eb;
-
-    padding-bottom: 12px;
-
-}
-
-
-.grid {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(3, 1fr);
-
-    gap: 18px;
-
-}
-
-
-.field {
-
-    display: flex;
-
-    flex-direction: column;
-
-}
-
-
-.field label {
-
-    font-weight: bold;
-
-    font-size: 14px;
-
-    margin-bottom: 7px;
-
-}
-
-
-.field input {
-
-    padding: 11px;
-
-    border:
-        1px solid #cbd5e1;
-
-    border-radius: 6px;
-
-    font-size: 15px;
-
-}
-
-
-input:focus {
-
-    outline: none;
-
-    border-color: #2563eb;
-
-}
-
-
-button {
-
-    border: none;
-
-    padding:
-        12px 22px;
-
-    border-radius: 6px;
-
-    cursor: pointer;
-
-    background: #2563eb;
-
-    color: white;
-
-    font-weight: bold;
-
-    font-size: 15px;
-
-}
-
-
-button:hover {
-
-    background: #1d4ed8;
-
-}
-
-
-button.secondary {
-
-    background: #475569;
-
-}
-
-
-button.success {
-
-    background: #15803d;
-
-}
-
-
-.upload-box {
-
-    border:
-        2px dashed #94a3b8;
-
-    border-radius: 8px;
-
-    padding: 25px;
-
-    text-align: center;
-
-}
-
-
-#analysis {
-
-    margin-top: 20px;
-
-    background: #111827;
-
-    color: #e5e7eb;
-
-    padding: 18px;
-
-    border-radius: 6px;
-
-    max-height: 400px;
-
-    overflow: auto;
-
-    white-space: pre-wrap;
-
-    font-family: monospace;
-
-}
-
-
-.results {
-
-    background: #f8fafc;
-
-    padding: 20px;
-
-    border-radius: 8px;
-
-}
-
-
-.result-row {
-
-    display: flex;
-
-    justify-content: space-between;
-
-    padding: 8px 0;
-
-    border-bottom:
-        1px solid #e5e7eb;
-
-}
-
-
-.download {
-
-    display: inline-block;
-
-    margin-top: 20px;
-
-    padding:
-        12px 20px;
-
-    background: #15803d;
-
-    color: white;
-
-    text-decoration: none;
-
-    border-radius: 6px;
-
-    font-weight: bold;
-
-}
-
-
-.status {
-
-    margin-top: 15px;
-
-    font-weight: bold;
-
-}
-
-
-.warning {
-
-    background: #fff7ed;
-
-    border-left:
-        4px solid #f97316;
-
-    padding: 15px;
-
-    margin-top: 15px;
-
-}
-
-
-@media(max-width:850px) {
-
-    .grid {
-
-        grid-template-columns: 1fr;
-
-    }
-
-}
-
-
-</style>
-
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bridge Pipe Drawing Generator</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #eef1f5;
+            color: #172033;
+        }
+        .container {
+            max-width: 1100px;
+            margin: 30px auto;
+            padding: 20px;
+        }
+        h1 { margin-bottom: 8px; }
+        .subtitle {
+            color: #5d6675;
+            margin-bottom: 24px;
+        }
+        .card {
+            background: white;
+            border-radius: 14px;
+            padding: 22px;
+            margin-bottom: 18px;
+            box-shadow: 0 4px 18px rgba(0,0,0,.07);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 16px;
+        }
+        label {
+            display: block;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+        input, select {
+            width: 100%;
+            padding: 11px 12px;
+            border: 1px solid #cbd2dc;
+            border-radius: 8px;
+            font-size: 15px;
+        }
+        button {
+            border: 0;
+            border-radius: 9px;
+            padding: 12px 20px;
+            font-size: 15px;
+            font-weight: 700;
+            cursor: pointer;
+            background: #1264d6;
+            color: white;
+        }
+        button:hover { background: #0d4fae; }
+        .secondary {
+            background: #687386;
+        }
+        .result {
+            background: #f6f8fb;
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 15px;
+            white-space: pre-wrap;
+        }
+        .warning {
+            background: #fff5d8;
+            border: 1px solid #efd98d;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+        }
+        .success {
+            background: #e8f7ed;
+            border: 1px solid #a8d9b7;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+        }
+        .error {
+            background: #fdeaea;
+            border: 1px solid #e0a5a5;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+        }
+        @media (max-width: 700px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+    </style>
 </head>
-
-
 <body>
-
-
-<div class="header">
-
-    <h1>
-        Bridge Pipe Drawing Generator
-    </h1>
-
-    <p>
-        Fixed Master Drawing +
-        Variable Bridge / Pipe / Level Data
-    </p>
-
-</div>
-
-
 <div class="container">
-
-
-<!-- ===================================================== -->
-<!-- UPLOAD -->
-<!-- ===================================================== -->
-
-<div class="card">
-
-<h2>
-1. Upload Drawing
-</h2>
-
-
-<div class="upload-box">
-
-<input
-    type="file"
-    id="cadFile"
-    accept=".dwg,.dxf"
->
-
-
-<br><br>
-
-
-<button
-    onclick="analyzeDrawing()"
->
-
-Analyze Drawing
-
-</button>
-
-
-<div
-    id="uploadStatus"
-    class="status"
->
-</div>
-
-</div>
-
-
-<pre id="analysis">
-No drawing analyzed yet.
-</pre>
-
-
-</div>
-
-
-
-<!-- ===================================================== -->
-<!-- BRIDGE -->
-<!-- ===================================================== -->
-
-<div class="card">
-
-<h2>
-2. Bridge Data
-</h2>
-
-
-<div class="grid">
-
-
-<div class="field">
-
-<label>
-Bridge / Drawing No.
-</label>
-
-<input
-    id="bridge_no"
-    value="462"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Chainage
-</label>
-
-<input
-    id="chainage"
-    placeholder="273.640"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Span Length (m)
-</label>
-
-<input
-    id="span_length"
-    type="number"
-    step="0.001"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Bridge Width (m)
-</label>
-
-<input
-    id="bridge_width"
-    type="number"
-    step="0.001"
->
-
-</div>
-
-
-</div>
-
-</div>
-
-
-
-<!-- ===================================================== -->
-<!-- PIPE -->
-<!-- ===================================================== -->
-
-<div class="card">
-
-<h2>
-3. Pipe Data
-</h2>
-
-
-<div class="grid">
-
-
-<div class="field">
-
-<label>
-Pipe Outside Diameter (mm)
-</label>
-
-<input
-    id="pipe_od"
-    type="number"
-    value="1200"
-    step="1"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Pipe Inside Diameter (mm)
-</label>
-
-<input
-    id="pipe_id"
-    type="number"
-    step="1"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Pipe Wall Thickness (mm)
-</label>
-
-<input
-    id="pipe_wall"
-    type="number"
-    step="1"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Number of Pipes
-</label>
-
-<input
-    id="pipe_count"
-    type="number"
-    value="1"
-    min="1"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Pipe Length (m)
-</label>
-
-<input
-    id="pipe_length"
-    type="number"
-    value="20"
-    step="0.001"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Pipe Slope (%)
-</label>
-
-<input
-    id="pipe_slope"
-    type="number"
-    value="0"
-    step="0.001"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Pipe Spacing (mm)
-</label>
-
-<input
-    id="pipe_spacing"
-    type="number"
-    value="0"
-    step="1"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Crossing Angle (°)
-</label>
-
-<input
-    id="crossing_angle"
-    type="number"
-    value="90"
-    step="0.1"
->
-
-</div>
-
-
-</div>
-
-</div>
-
-
-
-<!-- ===================================================== -->
-<!-- LEVELS -->
-<!-- ===================================================== -->
-
-<div class="card">
-
-<h2>
-4. Level Data
-</h2>
-
-
-<div class="grid">
-
-
-<div class="field">
-
-<label>
-Existing / Bed RL
-</label>
-
-<input
-    id="existing_rl"
-    type="number"
-    step="0.001"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Bridge Underside RL
-</label>
-
-<input
-    id="bridge_rl"
-    type="number"
-    step="0.001"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Pipe Invert RL
-</label>
-
-<input
-    id="invert_rl"
-    type="number"
-    step="0.001"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Required Cover (m)
-</label>
-
-<input
-    id="cover"
-    type="number"
-    value="0"
-    step="0.001"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Required Clearance (m)
-</label>
-
-<input
-    id="clearance"
-    type="number"
-    value="0"
-    step="0.001"
->
-
-</div>
-
-
-</div>
-
-</div>
-
-
-
-<!-- ===================================================== -->
-<!-- GENERATE -->
-<!-- ===================================================== -->
-
-<div class="card">
-
-<h2>
-5. Generate Drawing
-</h2>
-
-
-<button
-    class="success"
-    onclick="generateDrawing()"
->
-
-Generate Drawing
-
-</button>
-
-
-<div
-    id="generateStatus"
-    class="status"
->
-</div>
-
-</div>
-
-
-
-<!-- ===================================================== -->
-<!-- RESULTS -->
-<!-- ===================================================== -->
-
-<div class="card">
-
-<h2>
-6. Calculated Drawing Data
-</h2>
-
-
-<div
-    id="results"
-    class="results"
->
-
-No drawing generated.
-
-</div>
-
-
-<a
-    id="download"
-    class="download"
-    style="display:none"
->
-
-Download DXF
-
-</a>
-
-
-</div>
-
-
-</div>
-
-
-<script>
-
-
-// ========================================================
-// ANALYZE
-// ========================================================
-
-
-async function analyzeDrawing() {
-
-
-    const file =
-        document
-        .getElementById("cadFile")
-        .files[0];
-
-
-    if (!file) {
-
-        alert(
-            "Please select a DWG or DXF file."
-        );
-
-        return;
-
-    }
-
-
-    const form =
-        new FormData();
-
-
-    form.append(
-        "file",
-        file
-    );
-
-
-    document
-        .getElementById("uploadStatus")
-        .innerText =
-            "Analyzing drawing...";
-
-
-    try {
-
-
-        const response =
-            await fetch(
-                "/analyze",
-                {
-
-                    method: "POST",
-
-                    body: form
-
-                }
-            );
-
-
-        const data =
-            await response.json();
-
-
-        if (!response.ok) {
-
-            throw new Error(
-                data.error ||
-                "Analysis failed."
-            );
-
-        }
-
-
-        document
-            .getElementById("analysis")
-            .textContent =
-                JSON.stringify(
-                    data,
-                    null,
-                    2
-                );
-
-
-        document
-            .getElementById("uploadStatus")
-            .innerText =
-                "Drawing analyzed successfully.";
-
-
-    }
-
-    catch(error) {
-
-
-        document
-            .getElementById("uploadStatus")
-            .innerText =
-                "ERROR: " +
-                error.message;
-
-
-    }
-
-}
-
-
-
-// ========================================================
-// GENERATE
-// ========================================================
-
-
-async function generateDrawing() {
-
-
-    const data = {
-
-
-        bridge: {
-
-
-            bridge_no:
-                document
-                .getElementById(
-                    "bridge_no"
-                ).value,
-
-
-            chainage:
-                document
-                .getElementById(
-                    "chainage"
-                ).value,
-
-
-            span_length:
-                Number(
-                    document
-                    .getElementById(
-                        "span_length"
-                    ).value
-                ),
-
-
-            bridge_width:
-                Number(
-                    document
-                    .getElementById(
-                        "bridge_width"
-                    ).value
-                )
-
-
-        },
-
-
-        pipe: {
-
-
-            od:
-                Number(
-                    document
-                    .getElementById(
-                        "pipe_od"
-                    ).value
-                ),
-
-
-            id:
-                Number(
-                    document
-                    .getElementById(
-                        "pipe_id"
-                    ).value
-                ),
-
-
-            wall:
-                Number(
-                    document
-                    .getElementById(
-                        "pipe_wall"
-                    ).value
-                ),
-
-
-            count:
-                Number(
-                    document
-                    .getElementById(
-                        "pipe_count"
-                    ).value
-                ),
-
-
-            length:
-                Number(
-                    document
-                    .getElementById(
-                        "pipe_length"
-                    ).value
-                ),
-
-
-            slope:
-                Number(
-                    document
-                    .getElementById(
-                        "pipe_slope"
-                    ).value
-                ),
-
-
-            spacing:
-                Number(
-                    document
-                    .getElementById(
-                        "pipe_spacing"
-                    ).value
-                ),
-
-
-            angle:
-                Number(
-                    document
-                    .getElementById(
-                        "crossing_angle"
-                    ).value
-                )
-
-
-        },
-
-
-        levels: {
-
-
-            existing:
-                Number(
-                    document
-                    .getElementById(
-                        "existing_rl"
-                    ).value
-                ),
-
-
-            bridge:
-                Number(
-                    document
-                    .getElementById(
-                        "bridge_rl"
-                    ).value
-                ),
-
-
-            invert:
-                Number(
-                    document
-                    .getElementById(
-                        "invert_rl"
-                    ).value
-                ),
-
-
-            cover:
-                Number(
-                    document
-                    .getElementById(
-                        "cover"
-                    ).value
-                ),
-
-
-            clearance:
-                Number(
-                    document
-                    .getElementById(
-                        "clearance"
-                    ).value
-                )
-
-
-        }
-
-
-    };
-
-
-    document
-        .getElementById(
-            "generateStatus"
-        )
-        .innerText =
-            "Generating drawing...";
-
-
-    try {
-
-
-        const response =
-            await fetch(
-                "/generate",
-                {
-
-                    method: "POST",
-
-                    headers: {
-
-                        "Content-Type":
-                            "application/json"
-
-                    },
-
-                    body:
-                        JSON.stringify(
-                            data
-                        )
-
-                }
-            );
-
-
-        const result =
-            await response.json();
-
-
-        if (!response.ok) {
-
-            throw new Error(
-                result.error ||
-                "Generation failed."
-            );
-
-        }
-
-
-        showResults(
-            result
-        );
-
-
-        document
-            .getElementById(
-                "generateStatus"
-            )
-            .innerText =
-                "Drawing generated successfully.";
-
-
-    }
-
-    catch(error) {
-
-
-        document
-            .getElementById(
-                "generateStatus"
-            )
-            .innerText =
-                "ERROR: " +
-                error.message;
-
-
-    }
-
-}
-
-
-
-// ========================================================
-// RESULTS
-// ========================================================
-
-
-function showResults(data) {
-
-
-    const c =
-        data.calculations;
-
-
-    document
-        .getElementById(
-            "results"
-        )
-        .innerHTML = `
-
-
-        <div class="result-row">
-
-            <span>
-                Pipe Centre RL
-            </span>
-
-            <strong>
-                ${c.pipe_center_rl.toFixed(3)}
-            </strong>
-
+    <h1>Bridge Pipe Drawing Generator</h1>
+    <div class="subtitle">
+        Generate a pipe-under-bridge drawing from a fixed CAD template.
+    </div>
+
+    {% if not dxf_available %}
+    <div class="warning">
+        The Python package <b>ezdxf</b> is not installed.
+        Install it with: <b>pip install ezdxf flask</b>
+    </div>
+    {% endif %}
+
+    <div class="card">
+        <h2>1. Master Drawing</h2>
+        <form action="/upload-master" method="post" enctype="multipart/form-data">
+            <input type="file" name="master_file" accept=".dxf,.dwg" required>
+            <br><br>
+            <button type="submit" class="secondary">Upload Master CAD</button>
+        </form>
+
+        {% if master_exists %}
+        <div class="success" style="margin-top:15px;">
+            Master DXF is available and ready.
+        </div>
+        {% endif %}
+    </div>
+
+    <form action="/generate" method="post">
+        <div class="card">
+            <h2>2. Bridge Data</h2>
+            <div class="grid">
+                <div>
+                    <label>Bridge / Drawing No.</label>
+                    <input name="drawing_no" value="462">
+                </div>
+                <div>
+                    <label>Chainage</label>
+                    <input name="chainage" value="273.640">
+                </div>
+                <div>
+                    <label>Span Length (m)</label>
+                    <input name="span_length" type="number" step="0.001" value="2.400">
+                </div>
+                <div>
+                    <label>Bridge Width (m)</label>
+                    <input name="bridge_width" type="number" step="0.001" value="8.000">
+                </div>
+            </div>
         </div>
 
-
-        <div class="result-row">
-
-            <span>
-                Pipe Top RL
-            </span>
-
-            <strong>
-                ${c.pipe_top_rl.toFixed(3)}
-            </strong>
-
+        <div class="card">
+            <h2>3. Pipe Data</h2>
+            <div class="grid">
+                <div>
+                    <label>Pipe OD (mm)</label>
+                    <input name="pipe_od" type="number" step="0.1" value="1200">
+                </div>
+                <div>
+                    <label>Pipe ID (mm)</label>
+                    <input name="pipe_id" type="number" step="0.1" value="1000">
+                </div>
+                <div>
+                    <label>Number of Pipes</label>
+                    <input name="number_of_pipes" type="number" min="1" step="1" value="1">
+                </div>
+                <div>
+                    <label>Pipe Length (m)</label>
+                    <input name="pipe_length" type="number" step="0.001" value="20">
+                </div>
+                <div>
+                    <label>Pipe Slope (%)</label>
+                    <input name="pipe_slope" type="number" step="0.001" value="0.500">
+                </div>
+                <div>
+                    <label>Pipe Spacing (m)</label>
+                    <input name="pipe_spacing" type="number" step="0.001" value="1.500">
+                </div>
+                <div>
+                    <label>Crossing Angle (degrees)</label>
+                    <input name="crossing_angle" type="number" step="0.1" value="90">
+                </div>
+            </div>
         </div>
 
-
-        <div class="result-row">
-
-            <span>
-                Pipe Bottom / Invert RL
-            </span>
-
-            <strong>
-                ${c.pipe_invert_rl.toFixed(3)}
-            </strong>
-
+        <div class="card">
+            <h2>4. Level Data</h2>
+            <div class="grid">
+                <div>
+                    <label>Existing / Bed RL (m)</label>
+                    <input name="bed_rl" type="number" step="0.001" value="100.000">
+                </div>
+                <div>
+                    <label>Bridge Underside RL (m)</label>
+                    <input name="bridge_underside_rl" type="number" step="0.001" value="103.000">
+                </div>
+                <div>
+                    <label>Pipe Invert RL (m)</label>
+                    <input name="pipe_invert_rl" type="number" step="0.001" value="101.000">
+                </div>
+                <div>
+                    <label>Required Cover (m)</label>
+                    <input name="required_cover" type="number" step="0.001" value="1.000">
+                </div>
+                <div>
+                    <label>Required Clearance (m)</label>
+                    <input name="required_clearance" type="number" step="0.001" value="0.600">
+                </div>
+            </div>
         </div>
 
-
-        <div class="result-row">
-
-            <span>
-                Pipe End Invert RL
-            </span>
-
-            <strong>
-                ${c.pipe_end_invert_rl.toFixed(3)}
-            </strong>
-
+        <div class="card">
+            <h2>5. Generate</h2>
+            <button type="submit">Generate Drawing</button>
+            <div id="result"></div>
         </div>
-
-
-        <div class="result-row">
-
-            <span>
-                Bridge Clearance
-            </span>
-
-            <strong>
-                ${c.bridge_clearance.toFixed(3)}
-                m
-            </strong>
-
-        </div>
-
-
-        `;
-
-
-    const link =
-        document
-        .getElementById(
-            "download"
-        );
-
-
-    link.href =
-        data.download_url;
-
-
-    link.style.display =
-        "inline-block";
-
-
-}
-
-
-
-// ========================================================
-
-</script>
-
-
+    </form>
+</div>
 </body>
-
 </html>
 """
 
 
-# ============================================================
-# CAD ANALYSIS
-# ============================================================
+def number(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
-def analyze_dxf_file(filename):
+def calculate_values(data):
+    pipe_od_mm = number(data.get("pipe_od"))
+    pipe_od_m = pipe_od_mm / 1000.0
 
-    doc = ezdxf.readfile(filename)
+    pipe_invert_rl = number(data.get("pipe_invert_rl"))
+    bridge_underside_rl = number(data.get("bridge_underside_rl"))
+    pipe_slope_percent = number(data.get("pipe_slope"))
+    pipe_length = number(data.get("pipe_length"))
 
-    msp = doc.modelspace()
+    pipe_center_rl = pipe_invert_rl + (pipe_od_m / 2.0)
+    pipe_top_rl = pipe_invert_rl + pipe_od_m
 
+    slope_difference = pipe_length * (pipe_slope_percent / 100.0)
+    pipe_end_invert_rl = pipe_invert_rl + slope_difference
 
-    entity_count = {}
-
-    layers = {}
-
-    text_objects = []
-
-    dimensions = []
-
-
-    for entity in msp:
-
-
-        entity_type =
-            entity.dxftype()
-
-
-        entity_count[
-            entity_type
-        ] = (
-            entity_count.get(
-                entity_type,
-                0
-            ) + 1
-        )
-
-
-        layer =
-            getattr(
-                entity.dxf,
-                "layer",
-                "0"
-            )
-
-
-        layers[layer] =
-            layers.get(
-                layer,
-                0
-            ) + 1
-
-
-        # ----------------------------------------------
-        # TEXT
-        # ----------------------------------------------
-
-
-        if entity_type == "TEXT":
-
-
-            text_objects.append({
-
-                "text":
-                    entity.dxf.text,
-
-                "layer":
-                    layer,
-
-                "x":
-                    round(
-                        entity.dxf.insert.x,
-                        3
-                    ),
-
-                "y":
-                    round(
-                        entity.dxf.insert.y,
-                        3
-                    )
-
-            })
-
-
-        # ----------------------------------------------
-        # MTEXT
-        # ----------------------------------------------
-
-
-        elif entity_type == "MTEXT":
-
-
-            text_objects.append({
-
-                "text":
-                    entity.text,
-
-                "layer":
-                    layer,
-
-                "x":
-                    round(
-                        entity.dxf.insert.x,
-                        3
-                    ),
-
-                "y":
-                    round(
-                        entity.dxf.insert.y,
-                        3
-                    )
-
-            })
-
-
-        # ----------------------------------------------
-        # DIMENSIONS
-        # ----------------------------------------------
-
-
-        elif entity_type == "DIMENSION":
-
-
-            dimensions.append({
-
-                "layer":
-                    layer,
-
-                "type":
-                    int(
-                        entity.dxf.dimtype
-                    ),
-
-                "text":
-                    getattr(
-                        entity.dxf,
-                        "text",
-                        ""
-                    )
-
-            })
-
+    available_clearance = bridge_underside_rl - pipe_top_rl
 
     return {
-
-
-        "units":
-            doc.header.get(
-                "$INSUNITS",
-                0
-            ),
-
-
-        "entity_count":
-            entity_count,
-
-
-        "layers":
-            layers,
-
-
-        "text_count":
-            len(
-                text_objects
-            ),
-
-
-        "texts":
-            text_objects[:500],
-
-
-        "dimension_count":
-            len(
-                dimensions
-            ),
-
-
-        "dimensions":
-            dimensions[:500],
-
-
-        "variable_parameters": [
-
-            "BRIDGE DATA",
-
-            "PIPE DATA",
-
-            "LEVEL DATA"
-
-        ],
-
-
-        "constant_parameters": [
-
-            "Jacking Pit",
-
-            "Receiving Pit",
-
-            "PCC",
-
-            "DLC",
-
-            "Curtain Wall",
-
-            "Revetment",
-
-            "Filter",
-
-            "Wing Return",
-
-            "Protection Works",
-
-            "Standard Notes",
-
-            "Symbols",
-
-            "Title Block"
-
-        ]
-
+        "pipe_od_m": pipe_od_m,
+        "pipe_center_rl": pipe_center_rl,
+        "pipe_top_rl": pipe_top_rl,
+        "pipe_end_invert_rl": pipe_end_invert_rl,
+        "available_clearance": available_clearance,
     }
 
 
-
-# ============================================================
-# DRAWING GENERATOR
-# ============================================================
-
-
-def generate_drawing(
-    bridge,
-    pipe,
-    levels
-):
+def ensure_layer(doc, name, color=1):
+    if name not in doc.layers:
+        doc.layers.add(name=name, color=color)
 
 
-    # --------------------------------------------------------
-    # Check master drawing
-    # --------------------------------------------------------
+def add_generated_geometry(doc, data, calc):
+    """
+    Adds a clearly separated generated pipe group.
 
+    IMPORTANT:
+    The master drawing remains unchanged. This function currently adds
+    generated geometry rather than guessing which existing master entities
+    correspond to site-specific dimensions.
 
-    if not MASTER_TEMPLATE.exists():
+    Once the exact 462 drawing entity/layer mapping is known, this function
+    is the place to update the existing master entities instead.
+    """
+    msp = doc.modelspace()
 
+    ensure_layer(doc, "GENERATED_PIPE", 1)
+    ensure_layer(doc, "GENERATED_TEXT", 2)
 
-        raise Exception(
+    # Drawing coordinates are intentionally isolated from the master template.
+    # These are placeholder coordinates until the exact CAD coordinate system
+    # of the 462 master drawing is mapped.
+    x0 = 0.0
+    y0 = 0.0
 
-            "Master drawing not found.\n\n"
+    od = calc["pipe_od_m"]
+    length = number(data.get("pipe_length"), 20.0)
+    angle = number(data.get("crossing_angle"), 90.0)
 
-            "Convert your 462 DWG to DXF and save it as:\n\n"
+    rad = math.radians(angle)
+    dx = length * math.cos(rad)
+    dy = length * math.sin(rad)
 
-            "templates/master.dxf"
-
-        )
-
-
-    # --------------------------------------------------------
-    # Load master
-    # --------------------------------------------------------
-
-
-    doc =
-        ezdxf.readfile(
-            MASTER_TEMPLATE
-        )
-
-
-    msp =
-        doc.modelspace()
-
-
-    # --------------------------------------------------------
-    # Create generated layer
-    # --------------------------------------------------------
-
-
-    GENERATED_LAYER =
-        "GENERATED_PIPE"
-
-
-    if (
-        GENERATED_LAYER
-        not in doc.layers
-    ):
-
-
-        doc.layers.new(
-            GENERATED_LAYER
-        )
-
-
-    # --------------------------------------------------------
-    # Pipe dimensions
-    # --------------------------------------------------------
-
-
-    pipe_od_m =
-        pipe["od"] / 1000.0
-
-
-    pipe_radius =
-        pipe_od_m / 2.0
-
-
-    # --------------------------------------------------------
-    # Pipe centre RL
-    # --------------------------------------------------------
-
-
-    pipe_center_rl = (
-
-        levels["invert"]
-
-        +
-
-        pipe_radius
-
+    # Main pipe centerline.
+    msp.add_line(
+        (x0, y0),
+        (x0 + dx, y0 + dy),
+        dxfattribs={"layer": "GENERATED_PIPE"}
     )
 
-
-    # --------------------------------------------------------
-    # Pipe top RL
-    # --------------------------------------------------------
-
-
-    pipe_top_rl = (
-
-        levels["invert"]
-
-        +
-
-        pipe_od_m
-
-    )
-
-
-    # --------------------------------------------------------
-    # Slope
-    # --------------------------------------------------------
-
-
-    slope =
-        pipe["slope"] / 100.0
-
-
-    pipe_end_invert_rl = (
-
-        levels["invert"]
-
-        +
-
-        (
-            pipe["length"]
-            * slope
-        )
-
-    )
-
-
-    # --------------------------------------------------------
-    # Clearance
-    # --------------------------------------------------------
-
-
-    bridge_clearance = (
-
-        levels["bridge"]
-
-        -
-
-        pipe_top_rl
-
-    )
-
-
-    # --------------------------------------------------------
-    # DRAWING COORDINATES
-    # --------------------------------------------------------
-    #
-    # IMPORTANT:
-    #
-    # These coordinates are placeholders until we map the
-    # actual 462 DWG entities.
-    #
-    # Once the actual DWG is analyzed, these values should
-    # reference the actual pipe alignment in your drawing.
-    #
-    # --------------------------------------------------------
-
-
-    start_x = 0
-
-    start_y = 0
-
-
-    angle =
-        math.radians(
-            pipe["angle"]
-        )
-
-
-    end_x = (
-
-        start_x
-
-        +
-
-        pipe["length"]
-        *
-        math.cos(angle)
-
-    )
-
-
-    end_y = (
-
-        start_y
-
-        +
-
-        pipe["length"]
-        *
-        math.sin(angle)
-
-    )
-
-
-    # --------------------------------------------------------
-    # DRAW PIPE CENTRE LINE
-    # --------------------------------------------------------
-
+    # Pipe outline as two offset lines for a simple representation.
+    nx = -math.sin(rad) * od / 2.0
+    ny = math.cos(rad) * od / 2.0
 
     msp.add_line(
-
-        (
-            start_x,
-            start_y,
-            pipe_center_rl
-        ),
-
-        (
-            end_x,
-            end_y,
-            pipe_center_rl
-            +
-            (
-                pipe_end_invert_rl
-                -
-                levels["invert"]
-            )
-        ),
-
-        dxfattribs={
-
-            "layer":
-                GENERATED_LAYER
-
-        }
-
+        (x0 + nx, y0 + ny),
+        (x0 + dx + nx, y0 + dy + ny),
+        dxfattribs={"layer": "GENERATED_PIPE"}
     )
 
-
-    # --------------------------------------------------------
-    # DRAW PIPE CROSS SECTIONS
-    # --------------------------------------------------------
-
-
-    msp.add_circle(
-
-        (
-            start_x,
-            start_y,
-            pipe_center_rl
-        ),
-
-        pipe_radius,
-
-        dxfattribs={
-
-            "layer":
-                GENERATED_LAYER
-
-        }
-
+    msp.add_line(
+        (x0 - nx, y0 - ny),
+        (x0 + dx - nx, y0 + dy - ny),
+        dxfattribs={"layer": "GENERATED_PIPE"}
     )
 
-
-    msp.add_circle(
-
-        (
-            end_x,
-            end_y,
-            pipe_center_rl
-            +
-            (
-                pipe_end_invert_rl
-                -
-                levels["invert"]
-            )
-        ),
-
-        pipe_radius,
-
-        dxfattribs={
-
-            "layer":
-                GENERATED_LAYER
-
-        }
-
+    # End caps.
+    msp.add_line(
+        (x0 + nx, y0 + ny),
+        (x0 - nx, y0 - ny),
+        dxfattribs={"layer": "GENERATED_PIPE"}
     )
 
+    msp.add_line(
+        (x0 + dx + nx, y0 + dy + ny),
+        (x0 + dx - nx, y0 + dy - ny),
+        dxfattribs={"layer": "GENERATED_PIPE"}
+    )
 
-    # --------------------------------------------------------
-    # ADD PIPE TEXT
-    # --------------------------------------------------------
+    text_lines = [
+        f"BRIDGE/DRAWING NO.: {data.get('drawing_no', '')}",
+        f"CHAINAGE: {data.get('chainage', '')}",
+        f"PIPE OD: {data.get('pipe_od', '')} mm",
+        f"NO. OF PIPES: {data.get('number_of_pipes', '')}",
+        f"PIPE INVERT RL: {number(data.get('pipe_invert_rl')):.3f}",
+        f"PIPE CENTRE RL: {calc['pipe_center_rl']:.3f}",
+        f"PIPE TOP RL: {calc['pipe_top_rl']:.3f}",
+        f"PIPE END INVERT RL: {calc['pipe_end_invert_rl']:.3f}",
+        f"AVAILABLE CLEARANCE: {calc['available_clearance']:.3f} m",
+    ]
+
+    text_y = y0 - 2.0
+
+    for line in text_lines:
+        msp.add_text(
+            line,
+            dxfattribs={
+                "layer": "GENERATED_TEXT",
+                "height": 0.25,
+            }
+        ).set_placement((x0, text_y))
+        text_y -= 0.35
 
 
-    text_height =
-        max(
-            0.15,
-            pipe_radius * 0.5
+def generate_dxf(data):
+    if ezdxf is None:
+        raise RuntimeError(
+            "ezdxf is not installed. Install it using: pip install ezdxf"
         )
 
-
-    msp.add_text(
-
-        (
-            f"PIPE OD: "
-            f"{pipe['od']:.0f} mm"
-        ),
-
-        height=text_height,
-
-        dxfattribs={
-
-            "layer":
-                GENERATED_LAYER
-
-        }
-
-    ).set_placement(
-
-        (
-            start_x,
-            start_y + 1,
-            pipe_center_rl
+    if not MASTER_DXF.exists():
+        raise RuntimeError(
+            "No master.dxf found. Upload your master DXF first."
         )
 
-    )
+    doc = ezdxf.readfile(str(MASTER_DXF))
+    calc = calculate_values(data)
+
+    add_generated_geometry(doc, data, calc)
+
+    output_name = f"generated_{uuid.uuid4().hex[:10]}.dxf"
+    output_path = OUTPUT_DIR / output_name
+    doc.saveas(str(output_path))
+
+    return output_path, calc
 
 
-    msp.add_text(
-
-        (
-            f"PIPE INVERT RL: "
-            f"{levels['invert']:.3f}"
-        ),
-
-        height=text_height,
-
-        dxfattribs={
-
-            "layer":
-                GENERATED_LAYER
-
-        }
-
-    ).set_placement(
-
-        (
-            start_x,
-            start_y + 1.5,
-            levels["invert"]
-        )
-
-    )
-
-
-    # --------------------------------------------------------
-    # SAVE
-    # --------------------------------------------------------
-
-
-    filename = (
-
-        "bridge_pipe_"
-
-        +
-
-        uuid.uuid4().hex
-
-        +
-
-        ".dxf"
-
-    )
-
-
-    output_file =
-        OUTPUT_FOLDER / filename
-
-
-    doc.saveas(
-        output_file
-    )
-
-
-    # --------------------------------------------------------
-    # RETURN RESULTS
-    # --------------------------------------------------------
-
-
-    return (
-
-        output_file,
-
-        {
-
-            "pipe_center_rl":
-                pipe_center_rl,
-
-            "pipe_top_rl":
-                pipe_top_rl,
-
-            "pipe_invert_rl":
-                levels["invert"],
-
-            "pipe_end_invert_rl":
-                pipe_end_invert_rl,
-
-            "bridge_clearance":
-                bridge_clearance
-
-        }
-
-    )
-
-
-
-# ============================================================
-# HOME PAGE
-# ============================================================
-
-
-@app.route(
-    "/",
-    methods=["GET"]
-)
-
-
-def home():
-
-
+@app.route("/", methods=["GET"])
+def index():
     return render_template_string(
-        HTML
+        HTML,
+        master_exists=MASTER_DXF.exists(),
+        dxf_available=ezdxf is not None,
     )
 
 
+@app.route("/upload-master", methods=["POST"])
+def upload_master():
+    if "master_file" not in request.files:
+        return "No master file uploaded.", 400
 
-# ============================================================
-# ANALYZE ROUTE
-# ============================================================
-
-
-@app.route(
-    "/analyze",
-    methods=["POST"]
-)
-
-
-def analyze():
-
-
-    if "file" not in request.files:
-
-
-        return jsonify({
-
-            "error":
-                "No CAD file uploaded."
-
-        }), 400
-
-
-    file =
-        request.files["file"]
-
+    file = request.files["master_file"]
 
     if not file.filename:
+        return "No master file selected.", 400
 
-
-        return jsonify({
-
-            "error":
-                "No file selected."
-
-        }), 400
-
-
-    extension =
-        Path(
-            file.filename
-        ).suffix.lower()
-
-
-    if extension not in [
-        ".dxf",
-        ".dwg"
-    ]:
-
-
-        return jsonify({
-
-            "error":
-                "Only DWG or DXF files are supported."
-
-        }), 400
-
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # ezdxf cannot directly read DWG.
-    #
-    # For now, DXF analysis is supported.
-    #
-    # --------------------------------------------------------
-
+    extension = Path(file.filename).suffix.lower()
 
     if extension == ".dwg":
-
-
-        return jsonify({
-
-            "error":
-                "DWG requires conversion to DXF first. "
-                "Please export the drawing as DXF for this version."
-
-        }), 400
-
-
-    filename = (
-
-        str(
-            UPLOAD_FOLDER
-            /
-
-            (
-                uuid.uuid4().hex
-                +
-                ".dxf"
-            )
-        )
-
-    )
-
-
-    file.save(
-        filename
-    )
-
-
-    try:
-
-
-        result =
-            analyze_dxf_file(
-                filename
-            )
-
-
-        return jsonify(
-            result
-        )
-
-
-    except Exception as e:
-
-
-        return jsonify({
-
-            "error":
-                str(e)
-
-        }), 500
-
-
-
-# ============================================================
-# GENERATE ROUTE
-# ============================================================
-
-
-@app.route(
-    "/generate",
-    methods=["POST"]
-)
-
-
-def generate():
-
-
-    try:
-
-
-        data =
-            request.get_json()
-
-
-        bridge =
-            data["bridge"]
-
-
-        pipe =
-            data["pipe"]
-
-
-        levels =
-            data["levels"]
-
-
-        output_file, calculations = (
-
-            generate_drawing(
-
-                bridge,
-
-                pipe,
-
-                levels
-
-            )
-
-        )
-
-
-        return jsonify({
-
-            "success":
-                True,
-
-
-            "calculations":
-                calculations,
-
-
-            "download_url":
-                "/download/"
-                +
-                output_file.name
-
-        })
-
-
-    except Exception as e:
-
-
-        return jsonify({
-
-            "success":
-                False,
-
-            "error":
-                str(e)
-
-        }), 500
-
-
-
-# ============================================================
-# DOWNLOAD
-# ============================================================
-
-
-@app.route(
-    "/download/<filename>"
-)
-
-
-def download(filename):
-
-
-    file =
-        OUTPUT_FOLDER
-        /
-        secure_filename(
-            filename
-        )
-
-
-    if not file.exists():
-
-
         return (
-            "File not found",
-            404
+            "DWG upload is not directly supported by ezdxf. "
+            "Please save/export the master drawing as DXF and upload the DXF."
+        ), 400
+
+    if extension != ".dxf":
+        return "Please upload a DXF file.", 400
+
+    file.save(str(MASTER_DXF))
+
+    return (
+        '<p>Master DXF uploaded successfully.</p>'
+        '<p><a href="/">Return to generator</a></p>'
+    )
+
+
+@app.route("/generate", methods=["POST"])
+def generate():
+    data = {
+        "drawing_no": request.form.get("drawing_no", ""),
+        "chainage": request.form.get("chainage", ""),
+        "span_length": request.form.get("span_length", ""),
+        "bridge_width": request.form.get("bridge_width", ""),
+        "pipe_od": request.form.get("pipe_od", ""),
+        "pipe_id": request.form.get("pipe_id", ""),
+        "number_of_pipes": request.form.get("number_of_pipes", ""),
+        "pipe_length": request.form.get("pipe_length", ""),
+        "pipe_slope": request.form.get("pipe_slope", ""),
+        "pipe_spacing": request.form.get("pipe_spacing", ""),
+        "crossing_angle": request.form.get("crossing_angle", ""),
+        "bed_rl": request.form.get("bed_rl", ""),
+        "bridge_underside_rl": request.form.get("bridge_underside_rl", ""),
+        "pipe_invert_rl": request.form.get("pipe_invert_rl", ""),
+        "required_cover": request.form.get("required_cover", ""),
+        "required_clearance": request.form.get("required_clearance", ""),
+    }
+
+    try:
+        output_path, calc = generate_dxf(data)
+
+        return render_template_string(
+            """
+            <!doctype html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <title>Drawing Generated</title>
+                <style>
+                    body {
+                        font-family: Arial, sans-serif;
+                        max-width: 800px;
+                        margin: 50px auto;
+                        padding: 20px;
+                    }
+                    .box {
+                        background: #f4f7fa;
+                        padding: 20px;
+                        border-radius: 10px;
+                        margin: 20px 0;
+                    }
+                    a, button {
+                        display: inline-block;
+                        padding: 12px 18px;
+                        background: #1264d6;
+                        color: white;
+                        text-decoration: none;
+                        border-radius: 8px;
+                        border: 0;
+                        cursor: pointer;
+                    }
+                </style>
+            </head>
+            <body>
+                <h1>Drawing Generated Successfully</h1>
+
+                <div class="box">
+                    <p><b>Pipe Centre RL:</b> {{ "%.3f"|format(calc.pipe_center_rl) }}</p>
+                    <p><b>Pipe Top RL:</b> {{ "%.3f"|format(calc.pipe_top_rl) }}</p>
+                    <p><b>Pipe End Invert RL:</b> {{ "%.3f"|format(calc.pipe_end_invert_rl) }}</p>
+                    <p><b>Available Clearance:</b> {{ "%.3f"|format(calc.available_clearance) }} m</p>
+                </div>
+
+                <p>
+                    <a href="/download/{{ filename }}">Download DXF</a>
+                </p>
+
+                <p>
+                    <a href="/">Generate Another Drawing</a>
+                </p>
+            </body>
+            </html>
+            """,
+            calc=type("Calc", (), calc),
+            filename=output_path.name,
         )
 
+    except Exception as exc:
+        return render_template_string(
+            """
+            <!doctype html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <title>Generation Error</title>
+            </head>
+            <body style="font-family:Arial;max-width:800px;margin:50px auto;padding:20px;">
+                <h1>Drawing Generation Error</h1>
+                <div style="background:#fdeaea;padding:20px;border-radius:10px;">
+                    {{ error }}
+                </div>
+                <p><a href="/">Return to generator</a></p>
+            </body>
+            </html>
+            """,
+            error=str(exc),
+        ), 500
+
+
+@app.route("/download/<filename>", methods=["GET"])
+def download(filename):
+    safe_name = Path(filename).name
+    file_path = OUTPUT_DIR / safe_name
+
+    if not file_path.exists():
+        return "File not found.", 404
 
     return send_file(
-
-        file,
-
+        str(file_path),
         as_attachment=True,
-
-        download_name=
-            file.name
-
+        download_name=safe_name,
     )
 
 
-
-# ============================================================
-# START SERVER
-# ============================================================
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "ezdxf_installed": ezdxf is not None,
+        "master_dxf_exists": MASTER_DXF.exists(),
+    })
 
 
 if __name__ == "__main__":
-
-
-    print()
-    print(
-        "=============================================="
-    )
-
-    print(
-        " BRIDGE PIPE DRAWING GENERATOR"
-    )
-
-    print(
-        "=============================================="
-    )
-
-    print()
-
-    print(
-        "Open:"
-    )
-
-    print(
-        "http://127.0.0.1:5000"
-    )
-
-    print()
-
-    print(
-        "Master drawing:"
-    )
-
-    print(
-        MASTER_TEMPLATE
-    )
-
-    print()
-
-
-    app.run(
-
-        host="0.0.0.0",
-
-        port=5000,
-
-        debug=True
-
-    )
-```
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
 
