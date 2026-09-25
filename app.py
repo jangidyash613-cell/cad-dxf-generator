@@ -1,8 +1,6 @@
-import math
 import os
 import tempfile
-from pathlib import Path
-
+import math
 import streamlit as st
 
 try:
@@ -12,625 +10,1069 @@ except ImportError:
 
 
 st.set_page_config(
-    page_title="Bridge 462 CAD Drawing Generator",
+    page_title="Bridge 462 Dynamic CAD Generator",
     page_icon="📐",
     layout="wide",
 )
 
-st.title("📐 Bridge 462 CAD Drawing Generator")
+st.title("📐 Bridge 462 Dynamic CAD Generator")
 st.caption(
-    "This version edits the existing master drawing instead of adding a separate drawing."
+    "Edits the existing master DXF. Barrel length, track count, "
+    "attached assemblies, repeated plan/detail views and existing pipe "
+    "length are updated together."
 )
 
 
 # ============================================================
-# BASIC HELPERS
+# MASTER DRAWING CONSTANTS
+# These values come from the supplied master_plan1.dxf.
 # ============================================================
 
-def f(value, default=0.0):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+MASTER_LEFT = 1817527.993068192
+MASTER_RIGHT = 1847667.993068192
+MASTER_LENGTH_MM = 30140.0
 
+# Main drawing window. The title block and notes outside this area
+# are intentionally protected.
+VIEW_X_MIN = 1810000.0
+VIEW_X_MAX = 1855500.0
+VIEW_Y_MIN = -617500.0
+VIEW_Y_MAX = -590500.0
 
-def get_dimension_text(doc, dim):
-    """
-    Read visible dimension text from the DIMENSION entity.
-    """
-    return str(dim.dxf.get("text", "") or "")
+TRACK_BLOCK_NAME = "Prop. Track Structure"
 
+TRACK_SECTION_Y = -593856.4102987697
 
-def set_vec_x(vec, x):
-    return (x, vec.y, vec.z)
+SECTION_LABEL_Y = -591444.5159887477
+PLAN_LABEL_Y = -602922.9663123128
 
-
-def set_vec_y(vec, y):
-    return (vec.x, y, vec.z)
+TRACK_NAMES = [
+    "℄ OF COMMON LOOP LINE",
+    "℄ OF UP MAIN",
+    "℄ OF DN MAIN",
+    "℄ OF DN LOOP LINE",
+]
 
 
 # ============================================================
-# DXF READING
+# DXF
 # ============================================================
 
 def read_dxf(uploaded_file):
     if ezdxf is None:
         raise RuntimeError(
-            "ezdxf is not installed. Put 'ezdxf' in requirements.txt."
+            "ezdxf is not installed. Add ezdxf to requirements.txt."
         )
-
-    if uploaded_file is None:
-        raise RuntimeError("Please upload the master DXF.")
 
     raw = uploaded_file.getvalue()
 
     if not raw:
-        raise RuntimeError("The uploaded DXF file is empty.")
+        raise RuntimeError("The uploaded DXF is empty.")
 
-    temp_name = None
+    path = None
 
     try:
         with tempfile.NamedTemporaryFile(
             suffix=".dxf",
             delete=False,
-        ) as tmp:
-            tmp.write(raw)
-            tmp.flush()
-            temp_name = tmp.name
+        ) as temp:
+            temp.write(raw)
+            temp.flush()
+            path = temp.name
 
         try:
-            return ezdxf.readfile(temp_name)
+            return ezdxf.readfile(path)
         except Exception:
             from ezdxf import recover
 
-            doc, auditor = recover.readfile(temp_name)
+            doc, auditor = recover.readfile(path)
 
             if auditor.has_errors:
                 st.warning(
-                    "The DXF required ezdxf recovery mode. "
-                    "The drawing was opened, but the source contains "
-                    "some DXF audit issues."
+                    "DXF recovery mode was used because the source "
+                    "contains audit issues."
                 )
 
             return doc
 
     finally:
-        if temp_name:
+        if path:
             try:
-                os.remove(temp_name)
+                os.remove(path)
             except OSError:
                 pass
 
 
 # ============================================================
-# FIND THE ACTUAL EXISTING 462 DIMENSIONS
+# POINT / ENTITY TRANSFORMATION
 # ============================================================
 
-def find_section_length_dimensions(doc):
+def p3(point, x=None, y=None):
+    return (
+        float(point.x if x is None else x),
+        float(point.y if y is None else y),
+        float(getattr(point, "z", 0.0)),
+    )
+
+
+def transform_x(x, old_left, old_right, new_right):
     """
-    In the supplied 462 master DXF, Section A-A has two existing
-    horizontal 30140 dimensions.
+    Piecewise longitudinal transformation:
 
-    Their handles in the supplied master are:
-        309E29D
-        309E4EA
+      x <= old_left:
+          unchanged
 
-    We first try the handles. If handles changed after a CAD save,
-    we fall back to finding horizontal DIMENSION entities whose
-    measured length is approximately 30140 mm.
+      old_left < x < old_right:
+          stretched/compressed to the new barrel
+
+      x >= old_right:
+          translated by the barrel-length difference
+
+    This is what makes the right wing/return and attached assembly
+    move instead of remaining at the old 30140 position.
     """
 
-    found = []
+    if x <= old_left:
+        return x
 
-    for handle in ("309E29D", "309E4EA"):
-        entity = doc.entitydb.get(handle)
-        if entity is not None and entity.dxftype() == "DIMENSION":
-            found.append(entity)
+    if x >= old_right:
+        return x + (new_right - old_right)
 
-    if len(found) >= 2:
-        return found[:2]
+    old_span = old_right - old_left
 
-    candidates = []
+    if old_span <= 0:
+        return x
 
-    for entity in doc.modelspace():
-        if entity.dxftype() != "DIMENSION":
-            continue
+    ratio = (new_right - old_left) / old_span
 
+    return old_left + (x - old_left) * ratio
+
+
+def entity_points(e):
+    """
+    Return representative points for an entity so we can decide
+    whether it belongs to the main drawing window.
+    """
+
+    t = e.dxftype()
+
+    try:
+        if t == "LINE":
+            return [e.dxf.start, e.dxf.end]
+
+        if t == "LWPOLYLINE":
+            return [
+                (p[0], p[1], 0)
+                for p in e.get_points()
+            ]
+
+        if t == "POLYLINE":
+            return [
+                v.dxf.location
+                for v in e.vertices
+            ]
+
+        if t == "INSERT":
+            return [e.dxf.insert]
+
+        if t in ("TEXT", "MTEXT"):
+            return [e.dxf.insert]
+
+        if t in ("CIRCLE", "ARC", "ELLIPSE"):
+            return [e.dxf.center]
+
+        if t == "POINT":
+            return [e.dxf.location]
+
+        if t == "DIMENSION":
+            points = []
+
+            for name in (
+                "defpoint",
+                "defpoint2",
+                "defpoint3",
+                "text_midpoint",
+            ):
+                if e.dxf.hasattr(name):
+                    points.append(getattr(e.dxf, name))
+
+            return points
+
+        if t in ("SOLID", "3DFACE"):
+            points = []
+
+            for name in (
+                "vtx0",
+                "vtx1",
+                "vtx2",
+                "vtx3",
+            ):
+                if e.dxf.hasattr(name):
+                    points.append(getattr(e.dxf, name))
+
+            return points
+
+    except Exception:
+        return []
+
+    return []
+
+
+def inside_main_view(e):
+    points = entity_points(e)
+
+    if not points:
+        return False
+
+    for point in points:
         try:
-            measurement = float(entity.dxf.actual_measurement)
-            p2 = entity.dxf.defpoint2
-            p3 = entity.dxf.defpoint3
+            x = float(point[0] if not hasattr(point, "x") else point.x)
+            y = float(point[1] if not hasattr(point, "y") else point.y)
 
-            horizontal = abs(p2.y - p3.y) < 5.0
-            close_to_original = abs(measurement - 30140.0) < 5.0
-
-            if horizontal and close_to_original:
-                candidates.append(entity)
+            if (
+                VIEW_X_MIN <= x <= VIEW_X_MAX
+                and VIEW_Y_MIN <= y <= VIEW_Y_MAX
+            ):
+                return True
 
         except Exception:
             continue
 
-    return candidates[:2]
+    return False
 
 
-def find_gl_dimensions(doc):
-    """
-    Find the two existing G.L. dimensions in Section A-A.
-    """
-
-    result = []
-
-    for handle in ("309E2F4", "309E2FD"):
-        entity = doc.entitydb.get(handle)
-        if entity is not None and entity.dxftype() == "DIMENSION":
-            result.append(entity)
-
-    if len(result) >= 2:
-        return result[:2]
-
-    for entity in doc.modelspace():
-        if entity.dxftype() != "DIMENSION":
-            continue
-
-        text = get_dimension_text(doc, entity).upper()
-
-        if "G.L." in text or "G.L" in text:
-            result.append(entity)
-
-    return result[:2]
-
-
-def find_bed_level_dimensions(doc):
-    """
-    Find the existing BED LEVEL dimensions around Section A-A.
-    """
-
-    result = []
-
-    for entity in doc.modelspace():
-        if entity.dxftype() != "DIMENSION":
-            continue
-
-        text = get_dimension_text(doc, entity).upper()
-
-        if "BED LEVEL" in text:
-            result.append(entity)
-
-    return result
-
-
-# ============================================================
-# UPDATE SECTION A-A LENGTH
-# ============================================================
-
-def update_length_dimension(dim, new_length_mm):
-    """
-    Change the existing dimension itself.
-
-    The original drawing is in millimetres:
-        30140 = 30.140 m
-
-    The left endpoint is retained.
-    The right endpoint is moved to:
-        left + new_length
-    """
-
-    left_x = dim.dxf.defpoint2.x
-    new_right_x = left_x + new_length_mm
-
-    dim.dxf.defpoint = set_vec_x(
-        dim.dxf.defpoint,
-        new_right_x,
-    )
-
-    dim.dxf.defpoint3 = set_vec_x(
-        dim.dxf.defpoint3,
-        new_right_x,
-    )
-
-    dim.dxf.text_midpoint = set_vec_x(
-        dim.dxf.text_midpoint,
-        left_x + new_length_mm / 2.0,
-    )
-
-    dim.dxf.actual_measurement = float(new_length_mm)
-
-    # Let ezdxf rebuild the graphical dimension block.
-    dim.render()
-
-
-def stretch_section_geometry(
-    doc,
+def transform_entity_x(
+    e,
     old_left,
     old_right,
     new_right,
 ):
     """
-    Stretch the actual Section A-A geometry horizontally.
-
-    This is the important difference from the previous code.
-
-    We do NOT simply add a new pipe at 0,0.
-
-    Existing lines/polylines/text in the Section A-A drawing
-    are stretched between the existing left and right barrel
-    boundaries.
-
-    Y coordinates and text heights are preserved.
+    Transform the existing entity itself.
     """
 
-    if abs(old_right - old_left) < 1:
-        return
+    t = e.dxftype()
 
-    scale = (new_right - old_left) / (old_right - old_left)
+    try:
 
-    xmin = old_left - 400.0
-    xmax = old_right + 400.0
+        if t == "LINE":
+            a = e.dxf.start
+            b = e.dxf.end
 
-    # Section A-A vertical range in the supplied master.
-    ymin = -599200.0
-    ymax = -594000.0
+            e.dxf.start = p3(
+                a,
+                transform_x(a.x, old_left, old_right, new_right),
+            )
 
-    def sx(x):
-        return old_left + (x - old_left) * scale
+            e.dxf.end = p3(
+                b,
+                transform_x(b.x, old_left, old_right, new_right),
+            )
 
-    for entity in list(doc.modelspace()):
+        elif t == "LWPOLYLINE":
+            new_points = []
 
-        typ = entity.dxftype()
+            for item in e.get_points():
+                new_points.append(
+                    (
+                        transform_x(
+                            item[0],
+                            old_left,
+                            old_right,
+                            new_right,
+                        ),
+                        item[1],
+                        item[2],
+                        item[3],
+                        item[4],
+                    )
+                )
 
-        # ----------------------------------------------------
-        # LINE
-        # ----------------------------------------------------
-        if typ == "LINE":
-            p1 = entity.dxf.start
-            p2 = entity.dxf.end
+            e.set_points(new_points)
 
-            if (
-                ymin <= p1.y <= ymax
-                and ymin <= p2.y <= ymax
-                and xmin <= p1.x <= xmax
-                and xmin <= p2.x <= xmax
+        elif t == "POLYLINE":
+            for vertex in e.vertices:
+                point = vertex.dxf.location
+
+                vertex.dxf.location = p3(
+                    point,
+                    transform_x(
+                        point.x,
+                        old_left,
+                        old_right,
+                        new_right,
+                    ),
+                )
+
+        elif t == "INSERT":
+            point = e.dxf.insert
+
+            e.dxf.insert = p3(
+                point,
+                transform_x(
+                    point.x,
+                    old_left,
+                    old_right,
+                    new_right,
+                ),
+            )
+
+        elif t in ("TEXT", "MTEXT"):
+            point = e.dxf.insert
+
+            e.dxf.insert = p3(
+                point,
+                transform_x(
+                    point.x,
+                    old_left,
+                    old_right,
+                    new_right,
+                ),
+            )
+
+        elif t in ("CIRCLE", "ARC", "ELLIPSE"):
+            point = e.dxf.center
+
+            e.dxf.center = p3(
+                point,
+                transform_x(
+                    point.x,
+                    old_left,
+                    old_right,
+                    new_right,
+                ),
+            )
+
+        elif t == "POINT":
+            point = e.dxf.location
+
+            e.dxf.location = p3(
+                point,
+                transform_x(
+                    point.x,
+                    old_left,
+                    old_right,
+                    new_right,
+                ),
+            )
+
+        elif t == "DIMENSION":
+            for name in (
+                "defpoint",
+                "defpoint2",
+                "defpoint3",
+                "text_midpoint",
             ):
-                entity.dxf.start = (sx(p1.x), p1.y, p1.z)
-                entity.dxf.end = (sx(p2.x), p2.y, p2.z)
+                if e.dxf.hasattr(name):
+                    point = getattr(e.dxf, name)
 
-        # ----------------------------------------------------
-        # LWPOLYLINE
-        # ----------------------------------------------------
-        elif typ == "LWPOLYLINE":
-            points = list(entity.get_points())
-
-            if not points:
-                continue
-
-            if all(
-                ymin <= p[1] <= ymax
-                and xmin <= p[0] <= xmax
-                for p in points
-            ):
-                new_points = []
-
-                for p in points:
-                    new_points.append(
-                        (
-                            sx(p[0]),
-                            p[1],
-                            p[2],
-                            p[3],
-                            p[4],
-                        )
+                    setattr(
+                        e.dxf,
+                        name,
+                        p3(
+                            point,
+                            transform_x(
+                                point.x,
+                                old_left,
+                                old_right,
+                                new_right,
+                            ),
+                        ),
                     )
 
-                entity.set_points(new_points)
-
-        # ----------------------------------------------------
-        # TEXT
-        # ----------------------------------------------------
-        elif typ == "TEXT":
-            p = entity.dxf.insert
-
-            if (
-                ymin <= p.y <= ymax
-                and xmin <= p.x <= xmax
-            ):
-                entity.dxf.insert = (sx(p.x), p.y, p.z)
-
-        # ----------------------------------------------------
-        # MTEXT
-        # ----------------------------------------------------
-        elif typ == "MTEXT":
-            p = entity.dxf.insert
-
-            if (
-                ymin <= p.y <= ymax
-                and xmin <= p.x <= xmax
-            ):
-                entity.dxf.insert = (sx(p.x), p.y, p.z)
-
-        # ----------------------------------------------------
-        # DIMENSIONS
-        # ----------------------------------------------------
-        elif typ == "DIMENSION":
             try:
-                pts = [
-                    entity.dxf.defpoint,
-                    entity.dxf.defpoint2,
-                    entity.dxf.defpoint3,
-                    entity.dxf.text_midpoint,
-                ]
-
-                if all(
-                    ymin <= p.y <= ymax
-                    and xmin <= p.x <= xmax
-                    for p in pts
-                ):
-                    entity.dxf.defpoint = (
-                        sx(entity.dxf.defpoint.x),
-                        entity.dxf.defpoint.y,
-                        entity.dxf.defpoint.z,
-                    )
-
-                    entity.dxf.defpoint2 = (
-                        sx(entity.dxf.defpoint2.x),
-                        entity.dxf.defpoint2.y,
-                        entity.dxf.defpoint2.z,
-                    )
-
-                    entity.dxf.defpoint3 = (
-                        sx(entity.dxf.defpoint3.x),
-                        entity.dxf.defpoint3.y,
-                        entity.dxf.defpoint3.z,
-                    )
-
-                    entity.dxf.text_midpoint = (
-                        sx(entity.dxf.text_midpoint.x),
-                        entity.dxf.text_midpoint.y,
-                        entity.dxf.text_midpoint.z,
-                    )
-
-                    entity.render()
-
+                e.render()
             except Exception:
                 pass
 
+        elif t in ("SOLID", "3DFACE"):
+            for name in (
+                "vtx0",
+                "vtx1",
+                "vtx2",
+                "vtx3",
+            ):
+                if e.dxf.hasattr(name):
+                    point = getattr(e.dxf, name)
+
+                    setattr(
+                        e.dxf,
+                        name,
+                        p3(
+                            point,
+                            transform_x(
+                                point.x,
+                                old_left,
+                                old_right,
+                                new_right,
+                            ),
+                        ),
+                    )
+
+    except Exception:
+        # Do not stop the whole drawing because one unusual entity
+        # cannot be transformed.
+        pass
+
 
 # ============================================================
-# UPDATE G.L. LEVEL
+# FIND THE EXISTING BARREL DIMENSIONS
 # ============================================================
 
-def update_gl_dimension(dim, new_rl):
+def find_barrel_dimensions(doc):
+    found = []
+
+    # Exact handles in the supplied master.
+    for handle in (
+        "309E29D",
+        "309E4EA",
+    ):
+        entity = doc.entitydb.get(handle)
+
+        if (
+            entity is not None
+            and entity.dxftype() == "DIMENSION"
+        ):
+            found.append(entity)
+
+    if len(found) >= 2:
+        return found[:2]
+
+    # Fallback: locate all 30140 dimensions.
+    for entity in doc.modelspace():
+
+        if entity.dxftype() != "DIMENSION":
+            continue
+
+        try:
+            measurement = float(
+                entity.dxf.actual_measurement
+            )
+
+            if abs(measurement - MASTER_LENGTH_MM) <= 10:
+                found.append(entity)
+
+        except Exception:
+            pass
+
+    return found
+
+
+# ============================================================
+# TRACKS
+# ============================================================
+
+def find_track_inserts(doc):
+    tracks = []
+
+    for entity in doc.modelspace():
+
+        if entity.dxftype() != "INSERT":
+            continue
+
+        name = str(
+            entity.dxf.get("name", "")
+        ).upper()
+
+        if name == TRACK_BLOCK_NAME.upper():
+            tracks.append(entity)
+
+    return sorted(
+        tracks,
+        key=lambda e: e.dxf.insert.x,
+    )
+
+
+def delete_existing_tracks(doc):
+    for entity in find_track_inserts(doc):
+        doc.modelspace().delete_entity(entity)
+
+
+def add_tracks(
+    doc,
+    number_of_tracks,
+    spacing_m,
+    new_left,
+    new_right,
+):
     """
-    Existing G.L. dimensions use drawing units in mm.
+    Rebuild the track structures using the actual master block.
 
-    Example:
-        97.300 m = 97300 mm above the dimension base point.
+    Track count is independent of barrel length.
+
+    The tracks are centred within the bridge/barrel width and use
+    the user-specified track spacing.
     """
 
-    base_y = dim.dxf.defpoint.y
+    if TRACK_BLOCK_NAME not in doc.blocks:
+        raise RuntimeError(
+            "The master DXF does not contain the "
+            "'Prop. Track Structure' block."
+        )
 
-    new_y = base_y + float(new_rl) * 1000.0
+    delete_existing_tracks(doc)
 
-    dim.dxf.defpoint2 = set_vec_y(
-        dim.dxf.defpoint2,
-        new_y,
+    count = int(number_of_tracks)
+
+    spacing_mm = max(
+        float(spacing_m) * 1000.0,
+        100.0,
     )
 
-    dim.dxf.defpoint3 = set_vec_y(
-        dim.dxf.defpoint3,
-        new_y,
-    )
+    centre = (
+        new_left + new_right
+    ) / 2.0
 
-    # Keep the normal dimension text position slightly below the level line.
-    dim.dxf.text_midpoint = set_vec_y(
-        dim.dxf.text_midpoint,
-        new_y - 206.0,
-    )
+    total = (
+        count - 1
+    ) * spacing_mm
 
-    dim.dxf.actual_measurement = float(new_rl)
-    dim.dxf.text = f"G.L.  {float(new_rl):.3f}"
+    first = centre - total / 2.0
 
-    dim.render()
+    positions = [
+        first + i * spacing_mm
+        for i in range(count)
+    ]
+
+    for x in positions:
+
+        insert = doc.modelspace().add_blockref(
+            TRACK_BLOCK_NAME,
+            (
+                x,
+                TRACK_SECTION_Y,
+            ),
+        )
+
+        insert.dxf.rotation = 0
+        insert.dxf.xscale = 1
+        insert.dxf.yscale = 1
+        insert.dxf.zscale = 1
+
+    return positions
 
 
-# ============================================================
-# UPDATE BED LEVEL
-# ============================================================
-
-def update_bed_dimension(dim, new_rl):
+def delete_track_labels(doc):
     """
-    Update an existing BED LEVEL dimension.
+    Remove only the four original track labels in the two track
+    label rows. Other notes remain untouched.
     """
 
-    base_y = dim.dxf.defpoint.y
-    new_y = base_y + float(new_rl) * 1000.0
+    for entity in list(doc.modelspace()):
 
-    dim.dxf.defpoint2 = set_vec_y(
-        dim.dxf.defpoint2,
-        new_y,
-    )
+        if entity.dxftype() not in (
+            "TEXT",
+            "MTEXT",
+        ):
+            continue
 
-    dim.dxf.defpoint3 = set_vec_y(
-        dim.dxf.defpoint3,
-        new_y,
-    )
+        text = str(
+            entity.dxf.get("text", "")
+        ).upper()
 
-    dim.dxf.text_midpoint = set_vec_y(
-        dim.dxf.text_midpoint,
-        new_y - 206.0,
-    )
+        if not any(
+            name.upper().replace("℄ ", "")
+            in text.replace("℄ ", "")
+            for name in TRACK_NAMES
+        ):
+            continue
 
-    dim.dxf.actual_measurement = float(new_rl)
+        y = entity.dxf.insert.y
 
-    # Preserve the original formatting/color controls while replacing
-    # only the displayed level.
-    old_text = get_dimension_text(None, dim)
+        if (
+            abs(y - SECTION_LABEL_Y) < 100
+            or abs(y - PLAN_LABEL_Y) < 100
+        ):
+            doc.modelspace().delete_entity(entity)
 
-    if "{\\C" in old_text:
-        dim.dxf.text = "{\\C0;BED LEVEL %.3f}" % float(new_rl)
-    else:
-        dim.dxf.text = "BED LEVEL %.3f" % float(new_rl)
 
-    dim.render()
+def add_track_labels(
+    doc,
+    track_positions,
+):
+    """
+    Add labels for both the upper section row and the plan row.
+    """
+
+    delete_track_labels(doc)
+
+    for row_y in (
+        SECTION_LABEL_Y,
+        PLAN_LABEL_Y,
+    ):
+
+        for i, x in enumerate(track_positions):
+
+            if i < len(TRACK_NAMES):
+                label = TRACK_NAMES[i]
+            else:
+                label = f"℄ OF TRACK {i + 1}"
+
+            text = doc.modelspace().add_mtext(
+                label,
+                dxfattribs={
+                    "layer": "Exist. Dimensions",
+                    "char_height": 300.0,
+                    "color": 242,
+                },
+            )
+
+            text.dxf.insert = (
+                x,
+                row_y,
+                0,
+            )
 
 
 # ============================================================
-# MODIFY THE EXISTING MASTER DRAWING
+# PIPE LENGTH
 # ============================================================
 
-def modify_master(
+def update_pipe_length_dimensions(
+    doc,
+    new_length_mm,
+):
+    """
+    The master contains two 30140 dimensions.
+
+    Both are changed automatically.
+
+    Any other 30140 dimension found after transformation is also
+    updated, so the second drawing/detail does not retain 30140.
+    """
+
+    changed = 0
+
+    for entity in doc.modelspace():
+
+        if entity.dxftype() != "DIMENSION":
+            continue
+
+        try:
+            measurement = float(
+                entity.dxf.actual_measurement
+            )
+
+            if abs(
+                measurement - MASTER_LENGTH_MM
+            ) <= 10:
+
+                entity.dxf.actual_measurement = (
+                    float(new_length_mm)
+                )
+
+                try:
+                    entity.render()
+                except Exception:
+                    pass
+
+                changed += 1
+
+        except Exception:
+            pass
+
+    return changed
+
+
+# ============================================================
+# TEXTUAL 30140 CLEANUP
+# ============================================================
+
+def replace_30140_text(
+    doc,
+    old_mm,
+    new_mm,
+):
+    """
+    If a drawing contains static text "30140", change it too.
+
+    This is deliberately limited to the main drawing window so
+    title-block revision/history text is not modified.
+    """
+
+    old_texts = {
+        "30140",
+        "30140.0",
+        "30140.00",
+    }
+
+    new_text = (
+        f"{new_mm:.0f}"
+    )
+
+    changed = 0
+
+    for entity in doc.modelspace():
+
+        if entity.dxftype() not in (
+            "TEXT",
+            "MTEXT",
+        ):
+            continue
+
+        if not inside_main_view(entity):
+            continue
+
+        text = str(
+            entity.dxf.get("text", "")
+        )
+
+        if text.strip() in old_texts:
+            entity.dxf.text = new_text
+            changed += 1
+
+    return changed
+
+
+# ============================================================
+# LEVELS
+# ============================================================
+
+def update_existing_level_text(
+    doc,
+    keyword,
+    new_value,
+):
+    """
+    Update existing MTEXT such as:
+        BED LEVEL: 93.070
+
+    The label stays; only the number changes.
+    """
+
+    changed = 0
+
+    for entity in doc.modelspace():
+
+        if entity.dxftype() not in (
+            "TEXT",
+            "MTEXT",
+        ):
+            continue
+
+        text = str(
+            entity.dxf.get("text", "")
+        )
+
+        if keyword.upper() not in text.upper():
+            continue
+
+        if not inside_main_view(entity):
+            continue
+
+        if keyword.upper() == "BED LEVEL":
+
+            if ":" in text:
+                prefix = text.split(":")[0]
+                entity.dxf.text = (
+                    f"{prefix}: {new_value:.3f}"
+                )
+            else:
+                entity.dxf.text = (
+                    f"BED LEVEL: {new_value:.3f}"
+                )
+
+            changed += 1
+
+    return changed
+
+
+# ============================================================
+# MAIN EDIT
+# ============================================================
+
+def edit_master(
     uploaded_file,
-    section_length_mm,
+    barrel_length_m,
+    pipe_length_m,
+    number_of_tracks,
+    track_spacing_m,
     gl_rl,
     bed_rl,
 ):
     doc = read_dxf(uploaded_file)
 
-    length_dims = find_section_length_dimensions(doc)
+    barrel_dims = find_barrel_dimensions(doc)
 
-    if not length_dims:
+    if not barrel_dims:
         raise RuntimeError(
-            "Could not locate the existing 30140 Section A-A "
-            "dimension in this master drawing."
+            "The existing 30140 mm barrel dimensions "
+            "could not be found in the master DXF."
         )
 
-    gl_dims = find_gl_dimensions(doc)
+    old_left = MASTER_LEFT
+    old_right = MASTER_RIGHT
 
-    if not gl_dims:
-        raise RuntimeError(
-            "Could not locate the existing G.L. 97.300 "
-            "dimensions in Section A-A."
+    # Prefer actual dimension endpoints from the master.
+    try:
+        p2 = barrel_dims[0].dxf.defpoint2
+        p3 = barrel_dims[0].dxf.defpoint3
+
+        old_left = min(
+            p2.x,
+            p3.x,
         )
 
-    old_length = float(
-        length_dims[0].dxf.actual_measurement
+        old_right = max(
+            p2.x,
+            p3.x,
+        )
+
+    except Exception:
+        pass
+
+    new_length_mm = (
+        float(barrel_length_m) * 1000.0
     )
 
-    old_left = length_dims[0].dxf.defpoint2.x
-    old_right = length_dims[0].dxf.defpoint3.x
+    new_right = (
+        old_left + new_length_mm
+    )
 
-    # Stretch actual Section A-A geometry first.
-    stretch_section_geometry(
+    # --------------------------------------------------------
+    # 1. Transform ALL existing main drawing entities.
+    # --------------------------------------------------------
+
+    transformed = 0
+
+    for entity in list(doc.modelspace()):
+
+        # Track structures are rebuilt separately.
+        if (
+            entity.dxftype() == "INSERT"
+            and str(
+                entity.dxf.get("name", "")
+            ).upper()
+            == TRACK_BLOCK_NAME.upper()
+        ):
+            continue
+
+        if not inside_main_view(entity):
+            continue
+
+        transform_entity_x(
+            entity,
+            old_left,
+            old_right,
+            new_right,
+        )
+
+        transformed += 1
+
+    # --------------------------------------------------------
+    # 2. Change both 30140 barrel dimensions.
+    # --------------------------------------------------------
+
+    dimension_changes = (
+        update_pipe_length_dimensions(
+            doc,
+            new_length_mm,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 3. Change static 30140 text if any exists.
+    # --------------------------------------------------------
+
+    text_changes = replace_30140_text(
         doc,
-        old_left,
-        old_right,
-        old_left + section_length_mm,
+        MASTER_LENGTH_MM,
+        new_length_mm,
     )
 
-    # Update both existing barrel-length dimensions.
-    for dim in length_dims:
-        update_length_dimension(
-            dim,
-            section_length_mm,
-        )
+    # --------------------------------------------------------
+    # 4. Update BED LEVEL text.
+    # --------------------------------------------------------
 
-    # Update both existing G.L. dimensions.
-    for dim in gl_dims:
-        update_gl_dimension(
-            dim,
-            gl_rl,
-        )
+    bed_changes = update_existing_level_text(
+        doc,
+        "BED LEVEL",
+        float(bed_rl),
+    )
 
-    # Update existing bed-level dimensions if requested.
-    bed_dims = find_bed_level_dimensions(doc)
+    # --------------------------------------------------------
+    # 5. Rebuild the actual track structures.
+    # --------------------------------------------------------
 
-    for dim in bed_dims:
-        update_bed_dimension(
-            dim,
-            bed_rl,
-        )
+    track_positions = add_tracks(
+        doc,
+        number_of_tracks,
+        track_spacing_m,
+        old_left,
+        new_right,
+    )
 
-    # Save to a temporary DXF.
-    with tempfile.NamedTemporaryFile(
-        suffix=".dxf",
-        delete=False,
-    ) as tmp:
-        output_path = tmp.name
+    # --------------------------------------------------------
+    # 6. Rebuild track labels in both views.
+    # --------------------------------------------------------
+
+    add_track_labels(
+        doc,
+        track_positions,
+    )
+
+    # --------------------------------------------------------
+    # 7. Save output.
+    # --------------------------------------------------------
+
+    output_path = None
 
     try:
-        doc.saveas(output_path)
 
-        with open(output_path, "rb") as file:
+        with tempfile.NamedTemporaryFile(
+            suffix=".dxf",
+            delete=False,
+        ) as temp:
+
+            output_path = temp.name
+
+        doc.saveas(
+            output_path
+        )
+
+        with open(
+            output_path,
+            "rb",
+        ) as file:
+
             output_bytes = file.read()
 
     finally:
-        try:
-            os.remove(output_path)
-        except OSError:
-            pass
 
-    return output_bytes, doc, old_length
+        if output_path:
+
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+    return {
+        "bytes": output_bytes,
+        "old_length_m": (
+            old_right - old_left
+        ) / 1000.0,
+        "new_length_m": barrel_length_m,
+        "transformed_entities": transformed,
+        "barrel_dimensions_changed": dimension_changes,
+        "static_text_changed": text_changes,
+        "bed_level_changed": bed_changes,
+        "tracks": len(track_positions),
+        "track_positions": track_positions,
+    }
 
 
 # ============================================================
-# SIDEBAR
+# USER INTERFACE
 # ============================================================
 
 with st.sidebar:
-    st.header("Master CAD")
 
-    master_file = st.file_uploader(
-        "Upload master DXF",
+    st.header("MASTER CAD")
+
+    master = st.file_uploader(
+        "Upload master_plan1.dxf",
         type=["dxf"],
-        help="Upload master_plan1.dxf or your equivalent master DXF.",
     )
 
-    if master_file:
+    if master:
         st.success(
-            f"Loaded: {master_file.name}"
+            f"Loaded: {master.name}"
         )
 
     st.divider()
 
     st.write(
-        "This version edits the existing Section A-A dimensions "
-        "inside the master CAD."
+        "Variable drawing data:"
+    )
+
+    st.write(
+        "• Barrel / pipe length"
+    )
+    st.write(
+        "• Number of tracks"
+    )
+    st.write(
+        "• Track spacing"
+    )
+    st.write(
+        "• Ground / bed levels"
+    )
+
+    st.divider()
+
+    st.warning(
+        "Do not upload the generated DXF as the master. "
+        "Always start from the original master_plan1.dxf."
     )
 
 
-# ============================================================
-# USER INPUTS
-# ============================================================
+# ------------------------------------------------------------
+# Bridge Data
+# ------------------------------------------------------------
 
 st.subheader("Bridge Data")
 
-c1, c2, c3, c4 = st.columns(4)
+b1, b2, b3, b4, b5 = st.columns(5)
 
-with c1:
+with b1:
     drawing_no = st.text_input(
-        "Bridge / Drawing No.",
-        value="462",
+        "Drawing No.",
+        "462",
     )
 
-with c2:
+with b2:
     chainage = st.text_input(
         "Chainage",
-        value="274/60.10",
+        "274/60.10",
     )
 
-with c3:
-    section_length_m = st.number_input(
-        "Section A-A Length (m)",
-        min_value=0.001,
+with b3:
+    barrel_length_m = st.number_input(
+        "Barrel Length (m)",
+        min_value=0.100,
         value=30.140,
         step=0.001,
         format="%.3f",
-        help="Existing master value is 30140 mm = 30.140 m.",
     )
 
-with c4:
-    bridge_width = st.number_input(
-        "Bridge Width (m)",
-        value=8.000,
+with b4:
+    span_m = st.number_input(
+        "Span (m)",
+        min_value=0.100,
+        value=2.400,
         step=0.001,
         format="%.3f",
     )
 
+with b5:
+    number_of_tracks = st.number_input(
+        "NO. OF TRACKS",
+        min_value=1,
+        max_value=20,
+        value=4,
+        step=1,
+        help="The master has 4 tracks. Change this to 3, 5, 6, etc.",
+    )
 
-st.subheader("Pipe Data")
+
+# ------------------------------------------------------------
+# Track / Pipe Data
+# ------------------------------------------------------------
+
+st.subheader("Track / Pipe Data")
 
 p1, p2, p3, p4 = st.columns(4)
 
 with p1:
+    track_spacing_m = st.number_input(
+        "Track Spacing (m)",
+        min_value=0.100,
+        value=4.800,
+        step=0.001,
+        format="%.3f",
+    )
+
+with p2:
     pipe_od = st.number_input(
         "Pipe OD (mm)",
         min_value=1.0,
@@ -638,20 +1080,13 @@ with p1:
         step=1.0,
     )
 
-with p2:
-    pipe_id = st.number_input(
-        "Pipe ID (mm)",
-        min_value=0.0,
-        value=1000.0,
-        step=1.0,
-    )
-
 with p3:
-    number_of_pipes = st.number_input(
-        "Number of Pipes",
-        min_value=1,
-        value=1,
-        step=1,
+    st.metric(
+        "Dismantling / Existing Pipe Length (m)",
+        f"{barrel_length_m:.3f}",
+    )
+    st.caption(
+        "This follows Barrel Length automatically."
     )
 
 with p4:
@@ -662,6 +1097,14 @@ with p4:
         format="%.3f",
     )
 
+# The existing/dismantling pipe in the master drawing is tied to
+# the 30140 barrel length. Therefore it follows the same variable.
+pipe_length_m = barrel_length_m
+
+
+# ------------------------------------------------------------
+# Level Data
+# ------------------------------------------------------------
 
 st.subheader("Level Data")
 
@@ -673,7 +1116,6 @@ with l1:
         value=97.300,
         step=0.001,
         format="%.3f",
-        help="Existing master value is 97.300.",
     )
 
 with l2:
@@ -682,7 +1124,6 @@ with l2:
         value=96.271,
         step=0.001,
         format="%.3f",
-        help="Existing master value is 96.271.",
     )
 
 with l3:
@@ -694,50 +1135,63 @@ with l3:
     )
 
 with l4:
-    required_clearance = st.number_input(
-        "Required Clearance (m)",
-        value=0.600,
-        step=0.001,
-        format="%.3f",
+    pipe_top_rl = (
+        pipe_invert_rl
+        + pipe_od / 1000.0
+    )
+
+    st.metric(
+        "Pipe Top RL",
+        f"{pipe_top_rl:.3f}",
+    )
+
+    st.metric(
+        "G.L. Clearance",
+        f"{gl_rl - pipe_top_rl:.3f} m",
     )
 
 
-# ============================================================
-# CALCULATED PIPE LEVELS
-# ============================================================
-
-pipe_od_m = pipe_od / 1000.0
-
-pipe_center_rl = pipe_invert_rl + pipe_od_m / 2.0
-pipe_top_rl = pipe_invert_rl + pipe_od_m
-
-available_clearance = gl_rl - pipe_top_rl
+# ------------------------------------------------------------
+# Preview of what will change
+# ------------------------------------------------------------
 
 st.divider()
 
-st.subheader("Calculated Pipe Levels")
+st.subheader("Change Preview")
 
-a1, a2, a3 = st.columns(3)
+q1, q2, q3, q4 = st.columns(4)
 
-a1.metric(
-    "Pipe Centre RL",
-    f"{pipe_center_rl:.3f}",
-)
-
-a2.metric(
-    "Pipe Top RL",
-    f"{pipe_top_rl:.3f}",
-)
-
-a3.metric(
-    "Available Clearance",
-    f"{available_clearance:.3f} m",
-)
-
-if available_clearance < required_clearance:
-    st.warning(
-        "Pipe top is below the required G.L. clearance."
+with q1:
+    st.metric(
+        "Master Barrel",
+        "30.140 m",
     )
+
+with q2:
+    st.metric(
+        "New Barrel",
+        f"{barrel_length_m:.3f} m",
+    )
+
+with q3:
+    st.metric(
+        "Master Tracks",
+        "4",
+    )
+
+with q4:
+    st.metric(
+        "New Tracks",
+        str(int(number_of_tracks)),
+    )
+
+st.caption(
+    "When Barrel Length changes, the centre barrel stretches/compresses "
+    "and the right-hand wing/return and attached assemblies translate "
+    "by the same length difference. The lower plan/detail and the "
+    "existing green/dismantling geometry are transformed in the same "
+    "longitudinal operation."
+)
 
 
 # ============================================================
@@ -747,78 +1201,96 @@ if available_clearance < required_clearance:
 st.divider()
 
 if st.button(
-    "Generate Edited Drawing",
+    "GENERATE EDITED DRAWING",
     type="primary",
     use_container_width=True,
 ):
 
-    if master_file is None:
+    if master is None:
         st.error(
-            "Upload master_plan1.dxf first."
+            "Please upload the original master_plan1.dxf."
         )
         st.stop()
 
     if ezdxf is None:
         st.error(
-            "ezdxf is missing. Add ezdxf to requirements.txt "
-            "and redeploy Streamlit."
+            "ezdxf is missing. Put 'ezdxf' in requirements.txt "
+            "and redeploy."
         )
         st.stop()
 
-    new_length_mm = section_length_m * 1000.0
-
     try:
+
         with st.spinner(
-            "Editing the existing CAD dimensions and Section A-A geometry..."
+            "Editing the actual master CAD entities..."
         ):
 
-            output, edited_doc, old_length = modify_master(
-                master_file,
-                new_length_mm,
+            result = edit_master(
+                master,
+                barrel_length_m,
+                pipe_length_m,
+                int(number_of_tracks),
+                track_spacing_m,
                 gl_rl,
                 bed_rl,
             )
 
         st.success(
-            "The existing master drawing has been edited."
+            "Master drawing edited successfully."
         )
 
         st.write(
-            f"Section A-A length changed from "
-            f"{old_length / 1000.0:.3f} m "
-            f"to {section_length_m:.3f} m."
+            f"Barrel: "
+            f"{result['old_length_m']:.3f} m → "
+            f"{result['new_length_m']:.3f} m"
         )
 
         st.write(
-            f"G.L. changed to {gl_rl:.3f} m."
+            f"Track count: "
+            f"{result['tracks']}"
         )
 
         st.write(
-            f"Bed Level changed to {bed_rl:.3f} m."
+            f"Existing CAD entities transformed: "
+            f"{result['transformed_entities']:,}"
+        )
+
+        st.write(
+            f"30140 dimensions changed: "
+            f"{result['barrel_dimensions_changed']}"
+        )
+
+        st.write(
+            f"Static 30140 text changed: "
+            f"{result['static_text_changed']}"
+        )
+
+        st.write(
+            f"Bed level text changed: "
+            f"{result['bed_level_changed']}"
         )
 
         filename = (
             f"Bridge_{drawing_no}_"
-            f"Edited_Chainage_"
-            f"{chainage.replace('/', '_').replace('.', '_')}.dxf"
+            f"{barrel_length_m:.3f}m_"
+            f"{int(number_of_tracks)}Tracks.dxf"
         )
 
         st.download_button(
-            label="⬇ Download Edited DXF",
-            data=output,
+            "⬇ DOWNLOAD EDITED DXF",
+            data=result["bytes"],
             file_name=filename,
             mime="application/dxf",
             use_container_width=True,
         )
 
-        st.info(
-            "The program now modifies the existing 30140 mm and "
-            "97.300 G.L. dimensions in the supplied 462 master drawing. "
-            "It also horizontally stretches the Section A-A geometry "
-            "between the existing barrel boundaries."
+        st.success(
+            "The output contains the edited master drawing, "
+            "not a newly drawn replacement."
         )
 
     except Exception as error:
+
         st.error(
             "Drawing editing failed."
         )
@@ -833,79 +1305,86 @@ if st.button(
 # DIAGNOSTICS
 # ============================================================
 
-with st.expander("Master drawing diagnostics"):
+with st.expander(
+    "DXF diagnostics / master mapping"
+):
 
-    if master_file is None:
-        st.write("No master DXF uploaded.")
+    if master is None:
+        st.write(
+            "Upload the original master DXF."
+        )
 
     elif ezdxf is None:
-        st.error("ezdxf is not installed.")
+        st.error(
+            "ezdxf is not installed."
+        )
 
     else:
-        try:
-            diagnostic_doc = read_dxf(master_file)
 
-            st.success("Master DXF successfully read.")
+        try:
+
+            diagnostic = read_dxf(
+                master
+            )
 
             st.write(
                 "DXF version:",
-                diagnostic_doc.dxfversion,
+                diagnostic.dxfversion,
             )
 
             st.write(
                 "Model-space entities:",
-                len(diagnostic_doc.modelspace()),
+                len(diagnostic.modelspace()),
             )
 
             st.write(
                 "Layers:",
-                len(diagnostic_doc.layers),
+                len(diagnostic.layers),
             )
 
             st.write(
                 "Blocks:",
-                len(diagnostic_doc.blocks),
+                len(diagnostic.blocks),
             )
 
-            length_dims = find_section_length_dimensions(
-                diagnostic_doc
+            dims = find_barrel_dimensions(
+                diagnostic
             )
 
-            gl_dims = find_gl_dimensions(
-                diagnostic_doc
-            )
-
-            bed_dims = find_bed_level_dimensions(
-                diagnostic_doc
+            tracks_found = find_track_inserts(
+                diagnostic
             )
 
             st.write(
-                "Section A-A length dimensions found:",
-                len(length_dims),
+                "30140 barrel dimensions found:",
+                len(dims),
             )
 
             st.write(
-                "G.L. dimensions found:",
-                len(gl_dims),
+                "Existing track blocks found:",
+                len(tracks_found),
             )
 
-            st.write(
-                "Bed-level dimensions found:",
-                len(bed_dims),
-            )
+            if dims:
 
-            if length_dims:
                 st.write(
-                    "Current Section A-A length:",
-                    f"{length_dims[0].dxf.actual_measurement:.0f} mm",
+                    "Current master barrel:",
+                    f"{float(dims[0].dxf.actual_measurement) / 1000.0:.3f} m",
                 )
 
-            if gl_dims:
-                st.write(
-                    "Current G.L.:",
-                    gl_dims[0].dxf.text,
-                )
+            st.write(
+                "Existing track block X positions:",
+                [
+                    round(
+                        t.dxf.insert.x,
+                        1,
+                    )
+                    for t in tracks_found
+                ],
+            )
 
         except Exception as error:
-            st.error("DXF diagnostic failed.")
-            st.code(str(error), language="text")
+
+            st.error(
+                str(error)
+            )
