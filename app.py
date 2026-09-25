@@ -198,6 +198,18 @@ def entity_points(e):
 
             return points
 
+        if t == "HATCH":
+            points = []
+            for path in e.paths:
+                for v in getattr(path, "vertices", []):
+                    points.append((v[0], v[1], 0))
+                for edge in getattr(path, "edges", []):
+                    for name in ("start", "end", "center"):
+                        if hasattr(edge, name):
+                            q = getattr(edge, name)
+                            points.append((q.x, q.y, getattr(q, "z", 0.0)))
+            return points
+
         if t in ("SOLID", "3DFACE"):
             points = []
 
@@ -239,6 +251,170 @@ def inside_main_view(e):
             continue
 
     return False
+
+
+def entity_xy_extents(e):
+    """Return (min_x, max_x, min_y, max_y) for common model-space entities."""
+    pts = entity_points(e)
+    if not pts:
+        return None
+    xs=[]; ys=[]
+    for point in pts:
+        try:
+            x=float(point.x if hasattr(point, "x") else point[0])
+            y=float(point.y if hasattr(point, "y") else point[1])
+            xs.append(x); ys.append(y)
+        except Exception:
+            pass
+    if not xs:
+        return None
+    return min(xs), max(xs), min(ys), max(ys)
+
+
+def transform_hatch_x(e, transform):
+    """Transform HATCH boundary geometry, including earth-cushion hatches."""
+    try:
+        for path in e.paths:
+            if hasattr(path, "vertices"):
+                # PolylinePath exposes a mutable vertex list. Mutate each
+                # vertex in place; assigning a replacement list is not
+                # persisted by all ezdxf versions.
+                for i, v in enumerate(list(path.vertices)):
+                    x=float(v[0]); y=float(v[1])
+                    tail=tuple(v[2:]) if len(v) > 2 else ()
+                    path.vertices[i] = (transform(x), y, *tail)
+            elif hasattr(path, "edges"):
+                for edge in path.edges:
+                    if hasattr(edge, "start"):
+                        edge.start = edge.start.replace(x=transform(edge.start.x))
+                    if hasattr(edge, "end"):
+                        edge.end = edge.end.replace(x=transform(edge.end.x))
+                    if hasattr(edge, "center"):
+                        edge.center = edge.center.replace(x=transform(edge.center.x))
+    except Exception:
+        # Some complex associative hatches cannot be edited safely by ezdxf.
+        # The surrounding linework is still transformed.
+        pass
+
+
+def transform_insert_x(e, old_left, old_right, new_right, dx):
+    """Move an INSERT without changing its block definition."""
+    try:
+        p=e.dxf.insert
+        x=p.x
+        # Track blocks are handled separately. Other right-side assemblies
+        # move as a complete assembly when their insertion point is right of
+        # the barrel end.
+        if x >= old_right - 2000.0:
+            e.dxf.insert = p3(p, x + dx)
+        else:
+            e.dxf.insert = p3(p, transform_x(x, old_left, old_right, new_right))
+    except Exception:
+        pass
+
+
+def transform_main_entity(e, old_left, old_right, new_right, dx):
+    """
+    Transform the master drawing with two behaviours:
+
+    1) Barrel/earth-cushion geometry between the two barrel ends is stretched.
+    2) The complete right-hand wing/return/attached assembly is translated by
+       the barrel-length difference, so its shape is NOT distorted.
+
+    This is intentionally based on the actual 462 drawing coordinates.
+    """
+    ext=entity_xy_extents(e)
+    if ext is None:
+        return
+    xmin,xmax,ymin,ymax=ext
+
+    # Section A-A / upper barrel and plan/detail longitudinal zones.
+    section_zone = (
+        ymax >= -609500.0 and ymin <= -594000.0
+    )
+    plan_zone = (
+        ymax >= -605500.0 and ymin <= -600500.0
+    )
+
+    # Right attached wing/return/earthwork assembly visible at the end of
+    # Section A-A. The master geometry begins about 1.3 m before the 30140
+    # barrel endpoint, so use a 2.5 m capture zone.
+    right_assembly = (
+        (section_zone or plan_zone)
+        and xmin >= old_right - 2500.0
+    )
+
+    # Entities that cross the barrel endpoint and continue into the wing/
+    # return are also treated as one attached assembly.
+    crossing_right = (
+        section_zone
+        and xmin < old_right
+        and xmax > old_right + 300.0
+    )
+
+    # The earth-cushion hatch spans exactly the original barrel and must be
+    # stretched with the barrel rather than left at 30140.
+    if e.dxftype() == "HATCH":
+        if section_zone or plan_zone:
+            transform_hatch_x(e, lambda x: transform_x(x, old_left, old_right, new_right))
+        return
+
+    if right_assembly or crossing_right:
+        # Move the whole attached assembly without distorting its geometry.
+        transform_entity_x_translate(e, dx)
+        return
+
+    # Normal barrel/plan geometry is stretched piecewise.
+    transform_entity_x(
+        e,
+        old_left,
+        old_right,
+        new_right,
+    )
+
+
+def transform_entity_x_translate(e, dx):
+    """Translate a complete entity in X, preserving its shape."""
+    t=e.dxftype()
+    try:
+        if t == "LINE":
+            e.dxf.start = p3(e.dxf.start, e.dxf.start.x + dx)
+            e.dxf.end = p3(e.dxf.end, e.dxf.end.x + dx)
+        elif t == "LWPOLYLINE":
+            pts=[]
+            for item in e.get_points():
+                pts.append((item[0]+dx,item[1],item[2],item[3],item[4]))
+            e.set_points(pts)
+        elif t == "POLYLINE":
+            for v in e.vertices:
+                q=v.dxf.location
+                v.dxf.location=p3(q,q.x+dx)
+        elif t == "INSERT":
+            q=e.dxf.insert
+            e.dxf.insert=p3(q,q.x+dx)
+        elif t in ("TEXT","MTEXT"):
+            q=e.dxf.insert
+            e.dxf.insert=p3(q,q.x+dx)
+        elif t in ("CIRCLE","ARC","ELLIPSE"):
+            q=e.dxf.center
+            e.dxf.center=p3(q,q.x+dx)
+        elif t == "POINT":
+            q=e.dxf.location
+            e.dxf.location=p3(q,q.x+dx)
+        elif t == "DIMENSION":
+            for name in ("defpoint","defpoint2","defpoint3","text_midpoint"):
+                if e.dxf.hasattr(name):
+                    q=getattr(e.dxf,name)
+                    setattr(e.dxf,name,p3(q,q.x+dx))
+            try: e.render()
+            except Exception: pass
+        elif t in ("SOLID","3DFACE"):
+            for name in ("vtx0","vtx1","vtx2","vtx3"):
+                if e.dxf.hasattr(name):
+                    q=getattr(e.dxf,name)
+                    setattr(e.dxf,name,p3(q,q.x+dx))
+    except Exception:
+        pass
 
 
 def transform_entity_x(
@@ -847,17 +1023,61 @@ def edit_master(
         ):
             continue
 
-        if not inside_main_view(entity):
+        # Use the actual drawing zones instead of a simple viewport test.
+        # This catches hatches/earth cushion and the right-hand wing/return
+        # assembly that were missed by earlier versions.
+        ext = entity_xy_extents(entity)
+        if ext is None:
             continue
 
-        transform_entity_x(
+        xmin, xmax, ymin, ymax = ext
+        relevant = (
+            (ymax >= -609500.0 and ymin <= -594000.0)
+            or (ymax >= -605500.0 and ymin <= -600500.0)
+        )
+
+        # Also include the lower existing/dismantling detail if it lies in
+        # the master drawing area.
+        if not relevant:
+            relevant = (
+                xmin >= 1815000.0 and xmax <= 1865000.0
+                and ymax >= -618000.0 and ymin <= -611000.0
+            )
+
+        if not relevant:
+            continue
+
+        transform_main_entity(
             entity,
             old_left,
             old_right,
             new_right,
+            new_right - old_right,
         )
 
         transformed += 1
+
+    # --------------------------------------------------------
+    # 1B. Move the existing green dismantling/pipe/detail geometry.
+    # The supplied drawing marks dismantling work in green. These entities
+    # are often outside the Section A-A barrel window, so move them with the
+    # same longitudinal datum instead of leaving them behind.
+    # --------------------------------------------------------
+    for entity in list(doc.modelspace()):
+        try:
+            if entity.dxftype() == "INSERT" and str(entity.dxf.get("name", "")).upper() == TRACK_BLOCK_NAME.upper():
+                continue
+            c = entity.dxf.get("color", 0)
+            if c != 3:
+                continue
+            ext = entity_xy_extents(entity)
+            if ext is None:
+                continue
+            xmin, xmax, ymin, ymax = ext
+            if (ymax >= -618000.0 and ymin <= -611000.0) and xmax >= 1815000.0:
+                transform_entity_x_translate(entity, new_right - old_right)
+        except Exception:
+            pass
 
     # --------------------------------------------------------
     # 2. Change both 30140 barrel dimensions.
